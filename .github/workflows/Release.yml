@@ -1,0 +1,191 @@
+name: Release
+
+# Publishes the plugin to NuGet for every pushed semver tag, prereleases included (vX.Y.Z and
+# vX.Y.Z-suffix), and attaches the package to the tag's GitHub release so it can also be uploaded to a
+# server by hand. The release is created if the tag doesn't have one yet (marked as a prerelease for
+# suffixed tags). The plugin's own assemblies are Authenticode-signed with Azure Artifact Signing before
+# they are packed; leaving the AZURE_SIGNING_ENDPOINT variable unset skips signing.
+#
+# Publishes through nuget.org Trusted Publishing: NuGet/login trades the job's OIDC token for a one-hour
+# API key, so no NuGet secret is stored. Needs a nuget.org Trusted Publishing policy for this repository,
+# Release.yml and the "release" environment, and the NUGET_USER variable (nuget.org profile name).
+#
+# For signing, needs the AZURE_CLIENT_ID, AZURE_TENANT_ID and
+# AZURE_SUBSCRIPTION_ID secrets and the AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT_NAME and
+# AZURE_SIGNING_CERT_PROFILE_NAME variables, all on the "release" environment.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: write # create the release and attach the package to it
+  id-token: write # OIDC token for Azure Artifact Signing and NuGet Trusted Publishing
+
+env:
+  PROJECT: src/LANCommander.Plugins.Docker/LANCommander.Plugins.Docker.csproj
+  OUTPUT: src/LANCommander.Plugins.Docker/bin/Release/net10.0
+  SIGNED_ASSEMBLIES: LANCommander.Plugins.Docker.dll
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      # The tag filter is a glob, so the tag is checked against the exact pattern here
+      - name: Parse Version
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+            echo "::notice::Tag '$TAG' is not vX.Y.Z or vX.Y.Z-suffix. Skipping publish."
+            echo "publish=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # The package takes the whole version; the SDK drops the suffix for the assembly version
+          echo "publish=true" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          [[ "$TAG" == *-* ]] && echo "prerelease=true" >> $GITHUB_OUTPUT || echo "prerelease=false" >> $GITHUB_OUTPUT
+
+  publish:
+    needs: prep
+    if: needs.prep.outputs.publish == 'true'
+    runs-on: windows-latest
+    environment: release
+    env:
+      VERSION: ${{ needs.prep.outputs.version }}
+      SIGNING_ENABLED: ${{ vars.AZURE_SIGNING_ENDPOINT != '' && 'true' || 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 8.0 is the runtime the signing action documents as a prerequisite
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release -p:Version=${{ env.VERSION }}
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release
+
+      - name: Report signing configuration
+        shell: pwsh
+        run: |
+          if ($env:SIGNING_ENABLED -ne 'true') {
+            Write-Host "::warning::AZURE_SIGNING_ENDPOINT is not set. Publishing an unsigned package."
+          }
+
+      - name: Azure Login
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: List assemblies to sign
+        if: env.SIGNING_ENABLED == 'true'
+        id: sign
+        shell: pwsh
+        run: |
+          $files = ($env:SIGNED_ASSEMBLIES -split ' ' | ForEach-Object { Join-Path $env:GITHUB_WORKSPACE "$env:OUTPUT/$_" }) -join ','
+          "files=$files" >> $env:GITHUB_OUTPUT
+
+      # Signed in bin/ after the build; pack --no-build takes the assemblies from there
+      - name: Sign assemblies
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE_NAME }}
+          files: ${{ steps.sign.outputs.files }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-azure-cli-credential: false
+
+      - name: Pack
+        run: dotnet pack ${{ env.PROJECT }} --no-build --configuration Release -p:Version=${{ env.VERSION }} -o ./artifacts
+
+      # Checks the copies inside the package, so a pack that picked up an unsigned build fails here
+      - name: Verify signatures
+        if: env.SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $package = Get-Item ./artifacts/*.nupkg
+          $staging = Join-Path $PWD 'verify-staging'
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($package.FullName, $staging)
+
+          foreach ($name in $env:SIGNED_ASSEMBLIES -split ' ') {
+            $signature = Get-AuthenticodeSignature -FilePath (Join-Path $staging "lib/net10.0/$name")
+
+            if ($signature.Status -ne 'Valid') { throw "$name : $($signature.Status) - $($signature.StatusMessage)" }
+            if (-not $signature.TimeStamperCertificate) { throw "$name : signed but not timestamped" }
+
+            Write-Host "$name : Valid ($($signature.SignerCertificate.Subject))"
+          }
+
+      # Requested immediately before the push: the key is only valid for an hour
+      - name: NuGet login
+        id: nuget
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      # The glob is expanded here because dotnet nuget push on Windows treats ./artifacts/*.nupkg as a
+      # literal path. The .snupkg next to it is pushed automatically.
+      - name: Publish to NuGet
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $packages = Get-ChildItem ./artifacts -Filter *.nupkg
+          if (-not $packages) { throw "No .nupkg found in ./artifacts" }
+
+          foreach ($package in $packages) {
+            dotnet nuget push $package.FullName --api-key ${{ steps.nuget.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { throw "Failed to push $($package.Name)" }
+          }
+
+      # A release made in the GitHub UI pushes its tag too, so it may already exist by now
+      - name: Attach package to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.prep.outputs.prerelease }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $packages = (Get-ChildItem ./artifacts -Filter *.nupkg).FullName
+
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $packages --clobber
+          } else {
+            $flags = @('--verify-tag', '--generate-notes', '--title', $env:TAG)
+            if ($env:PRERELEASE -eq 'true') { $flags += '--prerelease' }
+            gh release create $env:TAG $packages @flags
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Failed to attach the package to release $env:TAG" }

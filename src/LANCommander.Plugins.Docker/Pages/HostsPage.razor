@@ -1,0 +1,194 @@
+@page "/Plugins/Docker/Hosts"
+@inject DockerHosts Hosts
+@inject NotificationService Notifications
+
+<PageHeader Title="Docker Hosts" Subtitle="The Docker daemons game servers can run on">
+    <Extra>
+        <Button Primary Icon="IconType.Plus" OnClick="Add">Add Host</Button>
+    </Extra>
+</PageHeader>
+
+<PageContent>
+    <Flex Vertical Gap="Gap.Large">
+        <Typography Secondary>
+            Choose Docker as a server's engine on its General page, then a host from here and one of its containers.
+            The server is configured from the container itself: its image, environment, ports and volumes are changed on the server's Container page.
+        </Typography>
+
+        @if (_editing is { } editing)
+        {
+            <Card Title="@(IsNew(editing) ? "Add a Docker host" : $"Edit {editing.Name}")">
+                <Form Model="editing" OnSubmit="SaveAsync">
+                    <FormItem Label="Name" Required>
+                        <TextInput @bind-Value="editing.Name" AutoFocus />
+                    </FormItem>
+                    <FormItem Label="Address" Required Help="@AddressHelp" Class="edit-form-mono">
+                        <TextInput @bind-Value="editing.Address" Placeholder="@DockerHost.DefaultAddress" />
+                    </FormItem>
+
+                    @if (_testResult != null)
+                    {
+                        <Alert Success="_testSucceeded" Danger="!_testSucceeded">@_testResult</Alert>
+                    }
+
+                    <FormItem>
+                        <Flex Gap="Gap.Small">
+                            <Button Primary Submit>Save</Button>
+                            <Button Loading="_testing" OnClick="TestAsync">Test Connection</Button>
+                            <Button Text OnClick="Cancel">Cancel</Button>
+                        </Flex>
+                    </FormItem>
+                </Form>
+            </Card>
+        }
+
+        <Table TItem="DockerHost" Items="_hosts" Key="host => host.Id" NoPaging Small EmptyText="No Docker hosts. Add one to run servers in containers." SettingsKey="plugin-docker-hosts">
+            <Columns>
+                <TemplateColumn TItem="DockerHost" Title="Name">
+                    <Typography Strong>@context.Name</Typography>
+                </TemplateColumn>
+                <TemplateColumn TItem="DockerHost" Title="Address">
+                    <Typography Code>@context.Address</Typography>
+                </TemplateColumn>
+                <TemplateColumn TItem="DockerHost" Title="Status" Width="320px">
+                    @if (_status.TryGetValue(context.Id, out var status))
+                    {
+                        <Tag Success="status.Reachable" Danger="!status.Reachable" title="@status.Message">@(status.Reachable ? status.Message : "Unreachable")</Tag>
+                    }
+                    else
+                    {
+                        <Tag>Checking…</Tag>
+                    }
+                </TemplateColumn>
+                <ActionsColumn TItem="DockerHost">
+                    <Button Text Small Icon="IconType.PencilSimple" title="Edit" OnClick="() => Edit(context)" />
+                    <Popconfirm OnConfirm="() => Remove(context)" Title="@($"Remove {context.Name}?")" Description="Servers on it stop working until they are given another host. Its containers are left alone." OkText="Remove" Danger>
+                        <Button Text Small Danger Icon="IconType.Trash" title="Remove" />
+                    </Popconfirm>
+                </ActionsColumn>
+            </Columns>
+        </Table>
+    </Flex>
+</PageContent>
+
+@code {
+    IReadOnlyList<DockerHost> _hosts = [];
+    readonly Dictionary<Guid, (bool Reachable, string Message)> _status = new();
+
+    DockerHost? _editing;
+    bool _testing;
+    bool _testSucceeded;
+    string? _testResult;
+
+    static readonly string AddressHelp = $"{DockerHost.DefaultAddress} for the Docker daemon on this server; tcp://docker-host:2375 for another machine's. TLS connections aren't supported yet.";
+
+    protected override void OnInitialized() => Load();
+
+    bool IsNew(DockerHost host) => _hosts.All(h => h.Id != host.Id);
+
+    void Load()
+    {
+        _hosts = Hosts.All;
+
+        foreach (var host in _hosts)
+            _ = CheckAsync(host);
+    }
+
+    async Task CheckAsync(DockerHost host)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        try
+        {
+            _status[host.Id] = (true, await Hosts.TestAsync(host, timeout.Token));
+        }
+        catch (Exception ex)
+        {
+            _status[host.Id] = (false, ex.Message);
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    void Add()
+    {
+        _editing = new DockerHost
+        {
+            Name = _hosts.Count == 0 ? "Local" : "",
+            Address = _hosts.Count == 0 ? DockerHost.DefaultAddress : "",
+        };
+        _testResult = null;
+    }
+
+    void Edit(DockerHost host)
+    {
+        _editing = new DockerHost { Id = host.Id, Name = host.Name, Address = host.Address };
+        _testResult = null;
+    }
+
+    void Cancel()
+    {
+        _editing = null;
+        _testResult = null;
+    }
+
+    async Task TestAsync()
+    {
+        if (_editing == null)
+            return;
+
+        _testing = true;
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        try
+        {
+            _testResult = $"Connected to {await Hosts.TestAsync(_editing, timeout.Token)}";
+            _testSucceeded = true;
+        }
+        catch (Exception ex)
+        {
+            _testResult = ex.Message;
+            _testSucceeded = false;
+        }
+        finally
+        {
+            _testing = false;
+        }
+    }
+
+    Task SaveAsync()
+    {
+        if (_editing == null)
+            return Task.CompletedTask;
+
+        try
+        {
+            Hosts.Save(_editing);
+
+            Notifications.Success($"{_editing.Name} saved");
+
+            _status.Remove(_editing.Id);
+            _editing = null;
+            _testResult = null;
+
+            Load();
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, "The Docker host could not be saved");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    void Remove(DockerHost host)
+    {
+        Hosts.Remove(host.Id);
+        _status.Remove(host.Id);
+
+        Notifications.Success($"{host.Name} removed");
+
+        Load();
+    }
+}

@@ -1,0 +1,69 @@
+<Project>
+
+  <!--
+    Packs a LANCommander plugin as a NuGet package the server's Plugins page can install.
+
+    A plugin package's lib/<framework>/ folder is the plugin's drop-in folder: the plugin assembly
+    and the PluginAssembly items beside it, which are the plugin's private dependencies. The host
+    provides everything else, so the package lists no dependencies.
+
+    Its package types are read from the [LANCommanderPlugin] attribute when it is packed:
+    LANCommander.Plugin, plus LANCommander.Plugin.Server and/or LANCommander.Plugin.Launcher for the
+    hosts the attribute names. Hosts search their package sources for their own type.
+
+    Identical in every LANCommander.Plugins.* repository; change it in all of them together.
+  -->
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <!-- A package without dependencies warns that its lib folder has no dependency group to match -->
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <!-- EnableDynamicLoading writes one, but a plugin runs in its host's runtime and never reads it -->
+    <GenerateRuntimeConfigurationFiles>false</GenerateRuntimeConfigurationFiles>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);PackPluginAssemblies</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)package-icon.png" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)..\README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+  <!-- The plugin assembly is packed already; its private dependencies go beside it -->
+  <Target Name="PackPluginAssemblies">
+    <ItemGroup>
+      <BuildOutputInPackage Include="@(PluginAssembly->'$(OutDir)%(Identity).dll')" Condition="'%(Identity)' != '$(AssemblyName)'" />
+    </ItemGroup>
+  </Target>
+
+  <!--
+    Runs after the build and before the nuspec is written, so the attribute is read from this build.
+    The reader runs as a file-based app (.NET 10 SDK) because an inline task can't reference
+    System.Reflection.Metadata.
+  -->
+  <Target Name="SetPluginPackageTypes" BeforeTargets="GenerateNuspec">
+    <Exec Command="dotnet run --file &quot;$(MSBuildThisFileDirectory)read-plugin-hosts.cs&quot; -- &quot;$(TargetPath)&quot;"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          StandardOutputImportance="low"
+          StandardErrorImportance="low"
+          EnvironmentVariables="DOTNET_CLI_TELEMETRY_OPTOUT=1;DOTNET_NOLOGO=1">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_PluginHosts" />
+      <Output TaskParameter="ExitCode" PropertyName="_PluginHostsExitCode" />
+    </Exec>
+
+    <Error Condition="'$(_PluginHostsExitCode)' != '0'" Text="Can't pack $(AssemblyName) as a LANCommander plugin: $(_PluginHosts)" />
+    <Error Condition="'$(_PluginHosts)' == '0'" Text="Can't pack $(AssemblyName) as a LANCommander plugin: [LANCommanderPlugin] declares no hosts." />
+
+    <PropertyGroup>
+      <PackageType>LANCommander.Plugin</PackageType>
+      <PackageType Condition="$([MSBuild]::BitwiseAnd($(_PluginHosts), 1)) != 0">$(PackageType);LANCommander.Plugin.Server</PackageType>
+      <PackageType Condition="$([MSBuild]::BitwiseAnd($(_PluginHosts), 2)) != 0">$(PackageType);LANCommander.Plugin.Launcher</PackageType>
+    </PropertyGroup>
+
+    <Message Importance="high" Text="$(PackageId) package types: $(PackageType)" />
+  </Target>
+
+</Project>

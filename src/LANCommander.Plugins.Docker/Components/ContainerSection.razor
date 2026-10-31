@@ -1,0 +1,217 @@
+@* A server's Container page: the container's image, command, environment, ports and volumes *@
+@inject ContainerService Containers
+@inject IServerProvider Servers
+@inject NotificationService Notifications
+
+@if (_loading)
+{
+    <Empty Description="Reading the container…" />
+}
+else if (_error != null)
+{
+    <Alert Danger Title="The container could not be read">@_error</Alert>
+}
+else if (_spec is { } spec)
+{
+    <Form Model="spec" OnSubmit="ApplyAsync" Class="edit-form">
+        <Alert Info>
+            Docker can't change these on an existing container, so applying them replaces it: the old container is stopped, a new one is created with the same volumes, and it's started again if it was running.
+            Anything not shown here, such as its network, user and limits, is kept.
+        </Alert>
+
+        <div class="edit-form-pair">
+            <FormItem Label="Name" Class="edit-form-mono">
+                <TextInput @bind-Value="spec.Name" />
+            </FormItem>
+            <FormItem Label="Image" Class="edit-form-mono" Help="Pulled if the host doesn't have it. A newer image under the same tag is only used once pulled.">
+                <TextInput @bind-Value="spec.Image" />
+            </FormItem>
+        </div>
+
+        <FormItem Label="Command" Class="edit-form-mono" Help="Arguments for the image's entry point. Leave empty to use the image's own.">
+            <TextInput @bind-Value="spec.Command" />
+        </FormItem>
+
+        <div class="edit-form-pair">
+            <FormItem Label="Restart policy" Help="What Docker does when the container exits. LANCommander's own autostart works with any of these.">
+                <Select TValue="string" Items="RestartItems" @bind-Value="spec.RestartPolicy" />
+            </FormItem>
+            <FormItem Label="Console">
+                <Flex Vertical Gap="Gap.Small">
+                    <Checkbox @bind-Value="spec.Interactive">Keep standard input open, so commands can be sent from the Monitor</Checkbox>
+                    <Checkbox @bind-Value="spec.Terminal">Give the container a terminal</Checkbox>
+                </Flex>
+            </FormItem>
+        </div>
+
+        <Divider Class="edit-form-divider" />
+
+        <FormItem Label="Ports" Help="Ports the container listens on, and the host ports players reach them on. Leave the host port empty to not publish one.">
+            <Flex Vertical Gap="Gap.Small">
+                @foreach (var port in spec.Ports)
+                {
+                    <Flex Gap="Gap.Small" Align="Align.Center">
+                        <NumberInput TValue="int?" @bind-Value="port.HostPort" Min="1" Max="65535" Placeholder="Host port" />
+                        <span aria-hidden="true">→</span>
+                        <NumberInput TValue="int" @bind-Value="port.ContainerPort" Min="1" Max="65535" />
+                        <Select TValue="string" Items="ProtocolItems" @bind-Value="port.Protocol" />
+                        <TextInput @bind-Value="port.HostIp" Placeholder="Every address" />
+                        <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => spec.Ports.Remove(port)" />
+                    </Flex>
+                }
+                <Button Icon="IconType.Plus" OnClick="() => spec.Ports.Add(new PortMapping())">Add Port</Button>
+            </Flex>
+        </FormItem>
+
+        <FormItem Label="Environment" Help="Includes the variables the image sets.">
+            <Flex Vertical Gap="Gap.Small">
+                @foreach (var variable in spec.Environment)
+                {
+                    <Flex Gap="Gap.Small" Align="Align.Center">
+                        <TextInput @bind-Value="variable.Name" Placeholder="NAME" />
+                        <span aria-hidden="true">=</span>
+                        <TextInput @bind-Value="variable.Value" />
+                        <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => spec.Environment.Remove(variable)" />
+                    </Flex>
+                }
+                <Button Icon="IconType.Plus" OnClick="() => spec.Environment.Add(new EnvironmentVariable())">Add Variable</Button>
+            </Flex>
+        </FormItem>
+
+        <FormItem Label="Volumes" Help="A folder on the Docker host, or a volume's name, and where it appears in the container. Volumes Docker made without a name are listed by their id, so the new container keeps them.">
+            <Flex Vertical Gap="Gap.Small">
+                @foreach (var mount in spec.Mounts)
+                {
+                    <Flex Gap="Gap.Small" Align="Align.Center">
+                        <TextInput @bind-Value="mount.Source" Placeholder="/srv/game or a volume" />
+                        <span aria-hidden="true">→</span>
+                        <TextInput @bind-Value="mount.Destination" Placeholder="/data" />
+                        <Checkbox @bind-Value="mount.ReadOnly">Read only</Checkbox>
+                        <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => spec.Mounts.Remove(mount)" />
+                    </Flex>
+                }
+                <Button Icon="IconType.Plus" OnClick="() => spec.Mounts.Add(new VolumeMount())">Add Volume</Button>
+            </Flex>
+        </FormItem>
+
+        @if (_progress != null)
+        {
+            <Typography Secondary>@_progress</Typography>
+        }
+
+        <FormItem>
+            <Flex Gap="Gap.Small">
+                <Popconfirm OnConfirm="ApplyAsync" Title="Replace the container?" Description="It is stopped while it's replaced, and started again if it was running." OkText="Replace">
+                    <Button Primary Loading="_applying">Apply</Button>
+                </Popconfirm>
+                <Button Disabled="_applying" OnClick="LoadAsync">Discard</Button>
+            </Flex>
+        </FormItem>
+    </Form>
+}
+
+@code {
+    [Parameter, EditorRequired] public ServerEngineServer Server { get; set; } = default!;
+
+    static readonly IEnumerable<SelectItem<string>> RestartItems = ContainerDefinition.RestartPolicies.Select(p => new SelectItem<string>(p, p)).ToList();
+    static readonly IEnumerable<SelectItem<string>> ProtocolItems = [new("udp", "UDP"), new("tcp", "TCP")];
+
+    // The server's settings as this page last saw or wrote them; the page's parameter is the server
+    // as its editor loaded it, before any container this page replaced
+    DockerServerSettings Settings { get; set; } = new();
+    Guid _loadedFor;
+
+    ContainerDefinition? _spec;
+    bool _loading = true;
+    bool _applying;
+    string? _error;
+    string? _progress;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (Server.Id == _loadedFor)
+            return;
+
+        _loadedFor = Server.Id;
+        Settings = Server.GetSettings<DockerServerSettings>();
+
+        await LoadAsync();
+    }
+
+    async Task LoadAsync()
+    {
+        _loading = true;
+        _error = null;
+
+        try
+        {
+            if (Settings.HostId is not { } hostId || string.IsNullOrWhiteSpace(Settings.ContainerId))
+            {
+                _error = "Choose a Docker host and container on the server's General page first.";
+                return;
+            }
+
+            var container = await Containers.InspectAsync(hostId, Settings.ContainerId);
+
+            if (container == null)
+                _error = $"The host has no container \"{Settings.ContainerId}\". Choose another on the server's General page.";
+            else
+                _spec = ContainerDefinition.From(container);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    async Task ApplyAsync()
+    {
+        if (_spec == null || Settings.HostId is not { } hostId || _applying)
+            return;
+
+        _applying = true;
+
+        try
+        {
+            var name = await Containers.RecreateAsync(hostId, Settings.ContainerId, _spec, new Progress<string>(message => InvokeAsync(() =>
+            {
+                _progress = message;
+                StateHasChanged();
+            })));
+
+            // The server names the container; keep it pointing at the new one
+            if (name != Settings.ContainerId && await Servers.GetAsync(Server.Id) is { } server)
+            {
+                var settings = server.EngineSettings is { Length: > 0 } saved
+                    ? ServerEngineSettings.Read<DockerServerSettings>(saved)
+                    : Settings;
+
+                settings.ContainerId = name;
+
+                await Servers.UpdateAsync(server with { EngineSettings = ServerEngineSettings.Write(settings) });
+
+                Settings = settings;
+            }
+
+            Notifications.Success($"{name} replaced");
+
+            _progress = null;
+
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, "The container could not be replaced");
+
+            _progress = null;
+        }
+        finally
+        {
+            _applying = false;
+        }
+    }
+}

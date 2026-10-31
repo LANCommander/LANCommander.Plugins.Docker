@@ -1,0 +1,46 @@
+name: CI
+
+# Builds, tests and packs the plugin on every push and pull request, so a change that breaks the
+# package is caught before a release. The package is kept as an artifact for testing on a server.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release
+
+      - name: Pack
+        run: dotnet pack src/LANCommander.Plugins.Docker/LANCommander.Plugins.Docker.csproj --no-build --configuration Release -p:Version=0.0.0-ci.${{ github.run_number }} -o ./artifacts
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: ./artifacts/*.nupkg

@@ -1,0 +1,37 @@
+namespace LANCommander.Plugins.Docker.Hosts;
+
+/// <summary>The plugin's settings, kept by the server in the plugin's Settings.yaml.</summary>
+public sealed class DockerSettings
+{
+    /// <summary>The Docker hosts game servers can run on.</summary>
+    public List<DockerHost> Hosts { get; set; } = [];
+
+    /// <summary>
+    /// Whether the Docker hosts the server's built-in Docker engine used have been taken over, so a
+    /// host removed since isn't brought back.
+    /// </summary>
+    public bool LegacyHostsImported { get; set; }
+}
+
+/// <summary>A Docker daemon the plugin connects to.</summary>
+public sealed class DockerHost
+{
+    /// <summary>
+    /// Identifies the host to the servers that run on it. Hosts taken over from the built-in engine
+    /// keep the id they had there, which those servers name.
+    /// </summary>
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    public string Name { get; set; } = "";
+
+    /// <summary>
+    /// The daemon's address, e.g. <c>unix:///var/run/docker.sock</c>, <c>npipe://./pipe/docker_engine</c>
+    /// or <c>tcp://docker-host:2375</c>.
+    /// </summary>
+    public string Address { get; set; } = "";
+
+    /// <summary>The address of the local daemon on this operating system.</summary>
+    public static string DefaultAddress => OperatingSystem.IsWindows()
+        ? "npipe://./pipe/docker_engine"
+        : "unix:///var/run/docker.sock";
+}

@@ -1,0 +1,281 @@
+@* The Docker engine's part of a server's General page: which host and container the server is *@
+@inject DockerHosts Hosts
+@inject ContainerService Containers
+@inject NotificationService Notifications
+
+<div class="edit-form-pair">
+    <FormItem Label="Docker host">
+        <ChildContent>
+            <Select TValue="Guid?" Items="HostItems" Value="Settings.HostId" ValueChanged="SetHostAsync" Placeholder="Choose a host" />
+        </ChildContent>
+        <HelpTemplate>
+            @if (!Hosts.All.Any())
+            {
+                <span>No Docker hosts yet. Add one under <a href="@DockerRoutes.Hosts">Settings → Docker Hosts</a>.</span>
+            }
+        </HelpTemplate>
+    </FormItem>
+    <FormItem Label="Container" Class="edit-form-mono">
+        <ChildContent>
+            <Flex Gap="Gap.Small">
+                <Select TValue="string" Items="ContainerItems" Value="Settings.ContainerId" ValueChanged="SetContainerAsync" Disabled="Settings.HostId == null" Placeholder="Choose a container" Searchable />
+                <Button Icon="IconType.ArrowClockwise" title="Refresh" Disabled="Settings.HostId == null" Loading="_loading" OnClick="LoadContainersAsync" />
+                <Button Icon="IconType.Plus" title="Create a container" Disabled="Settings.HostId == null" OnClick="StartCreating" />
+            </Flex>
+        </ChildContent>
+        <HelpTemplate>
+            @if (_error != null)
+            {
+                <Typography Danger>@_error</Typography>
+            }
+        </HelpTemplate>
+    </FormItem>
+</div>
+
+<FormItem Label="Files folder" Class="edit-form-mono" Help="The folder in the container the server's Files page shows, such as its data volume. Empty for the container's working directory.">
+    <TextInput Value="@Settings.FilesPath" ValueChanged="SetFilesPath" Disabled="string.IsNullOrWhiteSpace(Settings.ContainerId)" Placeholder="@(String.IsNullOrWhiteSpace(_workingDirectory) ? "/" : _workingDirectory)" />
+</FormItem>
+
+@if (_creating is { } creating)
+{
+    <Card Title="Create a container" Subtitle="Its environment, ports and volumes are set on the server's Container page once the server is saved">
+        <div class="edit-form-pair">
+            <FormItem Label="Name" Class="edit-form-mono">
+                <TextInput @bind-Value="creating.Name" />
+            </FormItem>
+            <FormItem Label="Image" Class="edit-form-mono" Help="Pulled if the host doesn't have it.">
+                <TextInput @bind-Value="creating.Image" Placeholder="itzg/minecraft-server:latest" />
+            </FormItem>
+        </div>
+
+        @if (_progress != null)
+        {
+            <Typography Secondary>@_progress</Typography>
+        }
+
+        <Flex Gap="Gap.Small">
+            <Button Primary Loading="_creatingNow" OnClick="CreateAsync">Create</Button>
+            <Button Text OnClick="() => _creating = null">Cancel</Button>
+        </Flex>
+    </Card>
+}
+
+@if (_container is { } container)
+{
+    <Card Title="@container.Name" Subtitle="@container.Image">
+        <Extra>
+            <Tag Success="@(_state == "running")">@_status</Tag>
+        </Extra>
+        <ChildContent>
+            <Flex Vertical Gap="Gap.Small">
+                @if (container.Ports.Any(p => p.HostPort != null))
+                {
+                    <Typography Secondary Small>Published ports</Typography>
+                    <Flex Gap="Gap.Small" Wrap>
+                        @foreach (var port in container.Ports.Where(p => p.HostPort != null))
+                        {
+                            <Button Small Text title="Use as the port players connect to" OnClick="() => UsePort(port)">
+                                <Typography Code>@port</Typography>
+                            </Button>
+                        }
+                    </Flex>
+                }
+                else
+                {
+                    <Typography Secondary Small>The container publishes no ports.</Typography>
+                }
+
+                @if (container.Mounts.Count > 0)
+                {
+                    <Typography Secondary Small>@container.Mounts.Count volume(s): @string.Join(", ", container.Mounts.Select(m => m.Destination))</Typography>
+                }
+
+                @if (!Context.IsNew)
+                {
+                    <Typography Secondary Small>Change the image, environment, ports and volumes on the Container page.</Typography>
+                }
+            </Flex>
+        </ChildContent>
+    </Card>
+}
+
+@code {
+    [Parameter, EditorRequired] public ServerEngineEditorContext Context { get; set; } = default!;
+
+    DockerServerSettings Settings => Context.GetSettings<DockerServerSettings>();
+
+    IEnumerable<SelectItem<Guid?>> HostItems => Hosts.All.Select(h => new SelectItem<Guid?>(h.Id, h.Name)).ToList();
+
+    IReadOnlyList<ContainerSummary> _containers = [];
+    ContainerDefinition? _container;
+    string? _workingDirectory;
+    string? _state;
+    string? _status;
+    string? _error;
+    bool _loading;
+
+    ContainerDefinition? _creating;
+    bool _creatingNow;
+    string? _progress;
+
+    /// <summary>The host's containers by name; and the server's own, by id, if it was chosen before the plugin.</summary>
+    IEnumerable<SelectItem<string>> ContainerItems
+    {
+        get
+        {
+            var items = _containers.Select(c => new SelectItem<string>(c.Name, $"{c.Name} · {c.Image} · {c.State}")).ToList();
+            var current = Settings.ContainerId;
+
+            if (!string.IsNullOrWhiteSpace(current) && items.All(i => i.Value != current))
+            {
+                var byId = _containers.FirstOrDefault(c => c.Id.StartsWith(current, StringComparison.OrdinalIgnoreCase));
+
+                items.Insert(0, new SelectItem<string>(current, byId != null ? $"{byId.Name} · {byId.Image} · {byId.State}" : $"{current} (not found)"));
+            }
+
+            return items;
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadContainersAsync();
+    }
+
+    async Task SetHostAsync(Guid? hostId)
+    {
+        Context.SetSettings(new DockerServerSettings { HostId = hostId });
+
+        _container = null;
+        _creating = null;
+
+        await LoadContainersAsync();
+    }
+
+    async Task SetContainerAsync(string container)
+    {
+        var settings = Settings;
+
+        settings.ContainerId = container ?? "";
+        Context.SetSettings(settings);
+
+        await LoadContainerAsync();
+    }
+
+    void SetFilesPath(string? path)
+    {
+        var settings = Settings;
+
+        settings.FilesPath = string.IsNullOrWhiteSpace(path) ? null : path.Trim();
+        Context.SetSettings(settings);
+    }
+
+    async Task LoadContainersAsync()
+    {
+        _error = null;
+
+        if (Settings.HostId is not { } hostId)
+        {
+            _containers = [];
+            return;
+        }
+
+        _loading = true;
+
+        try
+        {
+            _containers = await Containers.ListAsync(hostId);
+        }
+        catch (Exception ex)
+        {
+            _containers = [];
+            _error = $"The host's containers could not be listed: {ex.Message}";
+        }
+        finally
+        {
+            _loading = false;
+        }
+
+        await LoadContainerAsync();
+    }
+
+    async Task LoadContainerAsync()
+    {
+        _container = null;
+        _workingDirectory = null;
+
+        if (Settings.HostId is not { } hostId || string.IsNullOrWhiteSpace(Settings.ContainerId))
+            return;
+
+        try
+        {
+            var inspected = await Containers.InspectAsync(hostId, Settings.ContainerId);
+
+            if (inspected == null)
+            {
+                _error = $"The host has no container \"{Settings.ContainerId}\".";
+                return;
+            }
+
+            _container = ContainerDefinition.From(inspected);
+            _workingDirectory = inspected.Config?.WorkingDir;
+            _state = inspected.State?.Status;
+            _status = inspected.State?.Status switch
+            {
+                "running" => "Running",
+                "exited" => $"Exited ({inspected.State.ExitCode})",
+                { } other => System.Globalization.CultureInfo.CurrentCulture.TextInfo.ToTitleCase(other),
+                null => "Unknown",
+            };
+        }
+        catch (Exception ex)
+        {
+            _error = $"The container could not be read: {ex.Message}";
+        }
+    }
+
+    void StartCreating()
+    {
+        var name = new string((Context.Server.Name ?? "").ToLowerInvariant()
+            .Select(c => char.IsAsciiLetterOrDigit(c) ? c : '-')
+            .ToArray()).Trim('-');
+
+        _creating = new ContainerDefinition { Name = string.IsNullOrEmpty(name) ? "game-server" : name };
+        _progress = null;
+    }
+
+    async Task CreateAsync()
+    {
+        if (_creating == null || Settings.HostId is not { } hostId)
+            return;
+
+        _creatingNow = true;
+
+        try
+        {
+            var name = await Containers.CreateAsync(hostId, _creating, new Progress<string>(message => InvokeAsync(() =>
+            {
+                _progress = message;
+                StateHasChanged();
+            })));
+
+            Notifications.Success($"Created {name}");
+
+            _creating = null;
+            _progress = null;
+
+            await LoadContainersAsync();
+            await SetContainerAsync(name);
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, "The container could not be created");
+        }
+        finally
+        {
+            _creatingNow = false;
+        }
+    }
+
+    void UsePort(PortMapping port) => Context.SetAddress(null, port.HostPort);
+}

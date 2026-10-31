@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="bunit" />
+    <PackageReference Include="coverlet.collector" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LANCommander.Plugins.Docker\LANCommander.Plugins.Docker.csproj" />
+    <!-- The plugin leaves these to its host; here, the tests are the host. -->
+    <PackageReference Include="LANCommander.SDK" />
+    <PackageReference Include="LANCommander.Server.Plugins" />
+    <PackageReference Include="LANCommander.Server.UI" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Where the plugin's own build put its drop-in folder, for the load test. -->
+    <AssemblyMetadata Include="PluginOutputDirectory" Value="$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\src\LANCommander.Plugins.Docker\bin\$(Configuration)\$(TargetFramework)\'))" />
+  </ItemGroup>
+
+</Project>

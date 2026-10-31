@@ -1,0 +1,102 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <Description>Runs LANCommander game servers as Docker containers, on any number of Docker hosts. Servers are configured from the containers themselves: image, environment, ports and volumes.</Description>
+    <Title>Docker</Title>
+    <Version>0.1.0</Version>
+    <PackageTags>lancommander;lancommander-plugin;docker;containers;game-servers</PackageTags>
+    <!-- An unresolved component tag silently renders as a raw HTML element; fail the build instead -->
+    <WarningsAsErrors>$(WarningsAsErrors);RZ10012</WarningsAsErrors>
+    <!--
+      Where the Deploy target copies the plugin: the host's data directory. Defaults to that of a
+      server run from a LANCommander checkout beside this repository.
+    -->
+    <LANCommanderDataDir Condition="'$(LANCommanderDataDir)' == ''">$(MSBuildThisFileDirectory)..\..\..\LANCommander\LANCommander.Server\Data\</LANCommanderDataDir>
+    <PluginDeployDirectory>$([MSBuild]::EnsureTrailingSlash('$(LANCommanderDataDir)'))Plugins\$(AssemblyName)\</PluginDeployDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!--
+    Host assemblies. The server loads these itself, and a plugin that shipped its own copies would
+    load them a second time into its own load context, where none of their types would be the
+    host's. They are compile-time references only. The packages they bring with them still reach
+    the output; KeepOnlyPluginFiles below strips those.
+  -->
+  <ItemGroup>
+    <PackageReference Include="LANCommander.SDK" ExcludeAssets="runtime" />
+    <PackageReference Include="LANCommander.Server.Plugins" ExcludeAssets="runtime" />
+    <PackageReference Include="LANCommander.Server.UI" ExcludeAssets="runtime" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Docker.DotNet.Enhanced" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <!-- Copies the plugin's NuGet dependencies to the output, as a plugin needs. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <!--
+      A .deps.json would describe the host's whole dependency graph, most of which is deliberately
+      not shipped. Without one, the plugin's load context resolves from the plugin folder alone and
+      leaves everything else to the host.
+    -->
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <PreserveCompilationContext>false</PreserveCompilationContext>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      The assemblies the drop-in folder carries: the plugin and the Docker client. The client's own
+      dependencies (System.IO.Pipelines, System.Text.Json and the like) are part of the shared
+      framework.
+    -->
+    <PluginAssembly Include="$(AssemblyName)" />
+    <PluginAssembly Include="Docker.DotNet" />
+  </ItemGroup>
+
+  <!--
+    The host's assemblies and packages arrive in the output by several routes (project references
+    flow transitively, and dynamic loading copies every package). Rather than chase each one, the
+    output is cut back to the plugin's own files once everything has been copied.
+  -->
+  <Target Name="KeepOnlyPluginFiles" AfterTargets="CopyFilesToOutputDirectory">
+    <PropertyGroup>
+      <_PluginAssemblyNames>;@(PluginAssembly);</_PluginAssemblyNames>
+    </PropertyGroup>
+    <ItemGroup>
+      <_PluginOutputFile Include="$(OutDir)**\*" />
+      <_PluginStrayFile Include="@(_PluginOutputFile)" Condition="'%(RecursiveDir)' != '' or !$(_PluginAssemblyNames.Contains(';%(Filename);'))" />
+    </ItemGroup>
+    <Delete Files="@(_PluginStrayFile)" />
+    <!-- The plugin ships nothing in subdirectories, so they all go. -->
+    <RemoveDir Directories="$([System.IO.Directory]::GetDirectories('$(OutDir)'))" />
+
+    <ItemGroup>
+      <_PluginUnexpectedAssembly Include="$(OutDir)*.dll" Exclude="@(PluginAssembly->'$(OutDir)%(Identity).dll')" />
+      <_PluginMissingAssembly Include="@(PluginAssembly)" Condition="!Exists('$(OutDir)%(Identity).dll')" />
+    </ItemGroup>
+    <Error Condition="'@(_PluginUnexpectedAssembly)' != ''" Text="Unexpected assemblies in the plugin output: @(_PluginUnexpectedAssembly->'%(Filename)%(Extension)', ', ')" />
+    <Error Condition="'@(_PluginMissingAssembly)' != ''" Text="Assemblies missing from the plugin output: @(_PluginMissingAssembly->'%(Identity).dll', ', ')" />
+  </Target>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="LANCommander.Plugins.Docker.Tests" />
+  </ItemGroup>
+
+  <!-- dotnet build -t:Deploy copies the plugin into the host's Plugins folder. -->
+  <Target Name="Deploy" DependsOnTargets="Build">
+    <ItemGroup>
+      <_PluginFile Include="$(OutDir)*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_PluginFile)" DestinationFiles="@(_PluginFile->'$(PluginDeployDirectory)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="Deployed $(AssemblyName) to $(PluginDeployDirectory)" />
+  </Target>
+
+  <!-- dotnet pack makes the package the server's Plugins page installs -->
+  <Import Project="..\..\build\PluginPackage.targets" />
+
+</Project>
