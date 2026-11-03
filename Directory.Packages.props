@@ -3,11 +3,12 @@
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
     <!--
       The LANCommander server the plugin is built for. Its packages are released together under the
-      server's version. The plugin needs IServerEngineExtension, which arrives after 2.2.0-alpha.3.
+      server's version. The plugin needs IServerEngineExtension and its consoles, which arrive in
+      2.2.0-beta.1.
       To build against an unreleased server, pack its SDK, Server.Plugins and Server.UI projects into
       artifacts/packages and pass -p:LANCommanderVersion=<version>; see the README.
     -->
-    <LANCommanderVersion Condition="'$(LANCommanderVersion)' == ''">2.2.0-alpha.4</LANCommanderVersion>
+    <LANCommanderVersion Condition="'$(LANCommanderVersion)' == ''">2.2.0-beta.1</LANCommanderVersion>
   </PropertyGroup>
   <ItemGroup Label="Host">
     <PackageVersion Include="LANCommander.SDK" Version="$(LANCommanderVersion)" />

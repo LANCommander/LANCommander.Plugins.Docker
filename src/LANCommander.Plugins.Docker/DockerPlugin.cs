@@ -10,8 +10,8 @@ using Microsoft.Extensions.Logging;
 [assembly: LANCommanderPlugin(
     typeof(LANCommander.Plugins.Docker.DockerPlugin),
     Id = LANCommander.Plugins.Docker.DockerPlugin.PluginId,
-    // IServerEngineExtension arrives after 2.2.0-alpha.3
-    MinHostVersion = "2.2.0-alpha.4",
+    // IServerEngineExtension and its consoles arrive in 2.2.0-beta.1
+    MinHostVersion = "2.2.0-beta.1",
     Hosts = PluginHost.Server)]
 
 namespace LANCommander.Plugins.Docker;
