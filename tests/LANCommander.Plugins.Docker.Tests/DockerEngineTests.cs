@@ -320,6 +320,35 @@ public sealed class DockerEngineTests : IAsyncLifetime
     }
 
     [DockerFact]
+    public async Task AReplacedContainerKeepsOnlyItsOwnSettingsAndItsPrivileges()
+    {
+        var client = _hosts.GetClient(_host.Id);
+
+        await _containers.CreateAsync(_host.Id, new ContainerDefinition
+        {
+            Name = _name,
+            Image = Image,
+            Environment = [new EnvironmentVariable { Name = "GREETING", Value = "hello" }],
+            Capabilities = ["NET_ADMIN"],
+        });
+
+        var spec = await _containers.DefinitionOfAsync(_host.Id, await client.Containers.InspectContainerAsync(_name));
+
+        // busybox's PATH and command are its own, not the container's
+        Assert.Equal(["GREETING=hello"], spec.Environment.Select(v => $"{v.Name}={v.Value}"));
+        Assert.Equal("", spec.Command);
+        Assert.Contains(spec.Defaults!.Environment, v => v.Name == "PATH");
+
+        await _containers.RecreateAsync(_host.Id, _name, spec);
+
+        var replaced = await client.Containers.InspectContainerAsync(_name);
+
+        Assert.Contains("GREETING=hello", replaced.Config.Env);
+        Assert.Contains(replaced.Config.Env, v => v.StartsWith("PATH=", StringComparison.Ordinal));
+        Assert.Equal(["NET_ADMIN"], replaced.HostConfig.CapAdd);
+    }
+
+    [DockerFact]
     public async Task AContainerThatCannotBeReplacedIsPutBack()
     {
         var server = await AddServerAsync("sleep 600");

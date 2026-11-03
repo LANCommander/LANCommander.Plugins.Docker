@@ -44,9 +44,13 @@
                 <TextInput @bind-Value="creating.Name" />
             </FormItem>
             <FormItem Label="Image" Class="edit-form-mono" Help="Pulled if the host doesn't have it.">
-                <TextInput @bind-Value="creating.Image" Placeholder="itzg/minecraft-server:latest" />
+                <TextInput Value="@creating.Image" ValueChanged="SetCreatingImage" Placeholder="lancommander/quake3:latest" />
             </FormItem>
         </div>
+
+        <FormItem>
+            <Checkbox Value="_serverImage" ValueChanged="SetServerImage">Run it as LANCommander's server images need: as root, allowed to mount the overlay over its files (SYS_ADMIN, AppArmor unconfined)</Checkbox>
+        </FormItem>
 
         @if (_progress != null)
         {
@@ -117,6 +121,10 @@
     ContainerDefinition? _creating;
     bool _creatingNow;
     string? _progress;
+
+    // Follows the image until the administrator chooses
+    bool _serverImage;
+    bool _serverImageChosen;
 
     /// <summary>The host's containers by name; and the server's own, by id, if it was chosen before the plugin.</summary>
     IEnumerable<SelectItem<string>> ContainerItems
@@ -242,7 +250,31 @@
 
         _creating = new ContainerDefinition { Name = string.IsNullOrEmpty(name) ? "game-server" : name };
         _progress = null;
+        _serverImage = false;
+        _serverImageChosen = false;
     }
+
+    void SetCreatingImage(string? image)
+    {
+        if (_creating == null)
+            return;
+
+        _creating.Image = image ?? "";
+
+        if (!_serverImageChosen)
+            _serverImage = IsServerImage(_creating.Image);
+    }
+
+    void SetServerImage(bool value)
+    {
+        _serverImage = value;
+        _serverImageChosen = true;
+    }
+
+    /// <summary>One of LANCommander's server images, which mount an overlay as root before starting the server as their own user.</summary>
+    internal static bool IsServerImage(string image) =>
+        image.Trim().StartsWith("lancommander/", StringComparison.OrdinalIgnoreCase)
+        || image.Trim().StartsWith("docker.io/lancommander/", StringComparison.OrdinalIgnoreCase);
 
     async Task CreateAsync()
     {
@@ -250,6 +282,9 @@
             return;
 
         _creatingNow = true;
+
+        _creating.CanMountOverlay = _serverImage;
+        _creating.User = _serverImage ? "root" : "";
 
         try
         {

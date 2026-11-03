@@ -43,6 +43,14 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
         }
     }
 
+    /// <summary>
+    /// The container's definition, read with the image it was created from so the image's defaults
+    /// are told apart from the container's own settings. Without that image, since removed from the
+    /// host, everything the container has is taken as its own.
+    /// </summary>
+    public async Task<ContainerDefinition> DefinitionOfAsync(Guid hostId, ContainerInspectResponse container, CancellationToken cancellationToken = default) =>
+        ContainerDefinition.From(container, await InspectImageAsync(hosts.GetClient(hostId), container.Image, cancellationToken));
+
     /// <summary>Creates a container, pulling its image first if the host doesn't have it. Returns its name.</summary>
     public async Task<string> CreateAsync(Guid hostId, ContainerDefinition spec, IProgress<string>? progress = null, CancellationToken cancellationToken = default)
     {
@@ -70,7 +78,7 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
         var client = hosts.GetClient(hostId);
         var old = await client.Containers.InspectContainerAsync(container, cancellationToken);
         var oldName = old.Name.TrimStart('/');
-        var parameters = spec.ToCreateParameters(old);
+        var parameters = spec.ToCreateParameters(old, await InspectImageAsync(client, old.Image, cancellationToken));
         var wasRunning = old.State?.Running == true;
 
         await PullIfMissingAsync(client, parameters.Image, progress, cancellationToken);
@@ -122,17 +130,26 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
         return parameters.Name;
     }
 
-    private async Task PullIfMissingAsync(DockerClient client, string image, IProgress<string>? progress, CancellationToken cancellationToken)
+    /// <summary>The image, by name or id; null if the host doesn't have it.</summary>
+    private static async Task<ImageInspectResponse?> InspectImageAsync(DockerClient client, string? image, CancellationToken cancellationToken)
     {
+        if (string.IsNullOrWhiteSpace(image))
+            return null;
+
         try
         {
-            await client.Images.InspectImageAsync(image, cancellationToken);
-
-            return;
+            return await client.Images.InspectImageAsync(image, cancellationToken);
         }
         catch (DockerApiException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {
+            return null;
         }
+    }
+
+    private async Task PullIfMissingAsync(DockerClient client, string image, IProgress<string>? progress, CancellationToken cancellationToken)
+    {
+        if (await InspectImageAsync(client, image, cancellationToken) != null)
+            return;
 
         progress?.Report($"Pulling {image}");
 

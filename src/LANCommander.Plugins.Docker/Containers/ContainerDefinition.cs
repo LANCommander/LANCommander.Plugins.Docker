@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using Docker.DotNet.Models;
 
 namespace LANCommander.Plugins.Docker.Containers;
@@ -8,6 +9,12 @@ namespace LANCommander.Plugins.Docker.Containers;
 /// itself, so there is nothing to keep in step with it; applying a change recreates the container,
 /// since Docker can't change these on one that exists.
 /// </summary>
+/// <remarks>
+/// A container's configuration as Docker reports it is the image's with the container's own on top.
+/// Read with the image it was created from, only what differs from the image is part of the
+/// definition, so a container recreated from a newer image picks up that image's defaults rather
+/// than keeping the old image's.
+/// </remarks>
 public sealed class ContainerDefinition
 {
     /// <summary>The container's name, without Docker's leading slash.</summary>
@@ -34,19 +41,81 @@ public sealed class ContainerDefinition
     /// <summary>Gives the container a terminal. Its output is then one stream rather than two.</summary>
     public bool Terminal { get; set; }
 
+    /// <summary>The user the entry point runs as, e.g. <c>root</c> or <c>1000:1000</c>. Empty uses the image's.</summary>
+    public string User { get; set; } = "";
+
+    /// <summary>Linux capabilities added to the container's, e.g. <c>SYS_ADMIN</c>.</summary>
+    public List<string> Capabilities { get; set; } = [];
+
+    /// <summary>Docker's security options for the container, e.g. <c>apparmor:unconfined</c>.</summary>
+    public List<string> SecurityOptions { get; set; } = [];
+
+    /// <summary>
+    /// What the image provides where the definition doesn't say, for showing alongside it; null when
+    /// the container was read without its image. Not applied: Docker applies the image's itself.
+    /// </summary>
+    public ImageDefaults? Defaults { get; init; }
+
     public static readonly IReadOnlyList<string> RestartPolicies = ["no", "on-failure", "unless-stopped", "always"];
 
-    public static ContainerDefinition From(ContainerInspectResponse container)
+    /// <summary>
+    /// Whether the container may mount file systems, as LANCommander's server images do to lay an
+    /// overlay over the server's files: with <c>SYS_ADMIN</c>, and without AppArmor's profile, which
+    /// forbids mounts even then. Setting it adds or removes both, leaving any others.
+    /// </summary>
+    public bool CanMountOverlay
+    {
+        get => Capabilities.Any(IsSysAdmin) && SecurityOptions.Any(IsAppArmorUnconfined);
+        set
+        {
+            Capabilities.RemoveAll(IsSysAdmin);
+            SecurityOptions.RemoveAll(IsAppArmorUnconfined);
+
+            if (value)
+            {
+                Capabilities.Add("SYS_ADMIN");
+                SecurityOptions.Add("apparmor:unconfined");
+            }
+        }
+    }
+
+    /// <summary>The capabilities and security options besides those <see cref="CanMountOverlay"/> stands for.</summary>
+    public IEnumerable<string> OtherPrivileges => CanMountOverlay
+        ? Capabilities.Where(c => !IsSysAdmin(c)).Concat(SecurityOptions.Where(o => !IsAppArmorUnconfined(o)))
+        : Capabilities.Concat(SecurityOptions);
+
+    private static bool IsSysAdmin(string capability) =>
+        capability.Trim().Equals("SYS_ADMIN", StringComparison.OrdinalIgnoreCase) || capability.Trim().Equals("CAP_SYS_ADMIN", StringComparison.OrdinalIgnoreCase);
+
+    // Docker takes both forms; ':' is the older
+    private static bool IsAppArmorUnconfined(string option) =>
+        option.Trim().Replace('=', ':').Equals("apparmor:unconfined", StringComparison.OrdinalIgnoreCase);
+
+    /// <param name="container">The container, as Docker reports it.</param>
+    /// <param name="image">
+    /// The image it was created from (by its id, <see cref="ContainerInspectResponse.Image"/>), to
+    /// leave out what the container only has from it. Without it, everything the container has is
+    /// part of the definition, and a recreated container keeps it.
+    /// </param>
+    public static ContainerDefinition From(ContainerInspectResponse container, ImageInspectResponse? image = null)
     {
         var config = container.Config ?? new ContainerConfig();
         var host = container.HostConfig ?? new HostConfig();
+        var defaults = image?.Config;
+
+        var imageEnvironment = new HashSet<string>(defaults?.Env ?? [], StringComparer.Ordinal);
+
+        // Docker drops the image's command when a container has an entry point of its own, so the
+        // command is only the image's if the entry point is too
+        var imageCommand = defaults != null && SameList(config.Entrypoint, defaults.Entrypoint) && SameList(config.Cmd, defaults.Cmd);
 
         return new ContainerDefinition
         {
             Name = container.Name?.TrimStart('/') ?? "",
             Image = config.Image ?? "",
-            Command = ShellWords.Join(config.Cmd),
+            Command = imageCommand ? "" : ShellWords.Join(config.Cmd),
             Environment = (config.Env ?? [])
+                .Where(variable => !imageEnvironment.Contains(variable))
                 .Select(EnvironmentVariable.Parse)
                 .ToList(),
             Ports = (host.PortBindings ?? new Dictionary<string, IList<PortBinding>>())
@@ -77,15 +146,25 @@ public sealed class ContainerDefinition
             },
             Interactive = config.OpenStdin,
             Terminal = config.Tty,
+            User = defaults != null && (config.User ?? "") == (defaults.User ?? "") ? "" : config.User ?? "",
+            Capabilities = (host.CapAdd ?? []).ToList(),
+            SecurityOptions = (host.SecurityOpt ?? []).ToList(),
+            Defaults = defaults == null ? null : new ImageDefaults
+            {
+                Environment = (defaults.Env ?? []).Select(EnvironmentVariable.Parse).ToList(),
+                Command = ShellWords.Join(defaults.Cmd),
+                User = defaults.User ?? "",
+            },
         };
     }
 
     /// <summary>
     /// What to create the container from. With <paramref name="basis"/>, the container this one
-    /// replaces, everything the spec doesn't cover is kept from it: entry point, user, network,
-    /// limits and so on.
+    /// replaces, everything the spec doesn't cover is kept from it: entry point, network, limits and
+    /// so on. With <paramref name="basisImage"/>, the image <paramref name="basis"/> was created from,
+    /// what it only had from that image is left to the new container's image instead.
     /// </summary>
-    public CreateContainerParameters ToCreateParameters(ContainerInspectResponse? basis = null)
+    public CreateContainerParameters ToCreateParameters(ContainerInspectResponse? basis = null, ImageInspectResponse? basisImage = null)
     {
         Validate();
 
@@ -96,8 +175,12 @@ public sealed class ContainerDefinition
         if (basis?.ID != null && parameters.Hostname != null && basis.ID.StartsWith(parameters.Hostname, StringComparison.Ordinal))
             parameters.Hostname = null;
 
+        if (basisImage?.Config is { } old)
+            LeaveToImage(parameters, old);
+
         parameters.Name = Name.Trim();
         parameters.Image = Image.Trim();
+        parameters.User = string.IsNullOrWhiteSpace(User) ? null : User.Trim();
         parameters.Cmd = string.IsNullOrWhiteSpace(Command) ? null : ShellWords.Split(Command);
         parameters.Env = Environment
             .Where(variable => !string.IsNullOrWhiteSpace(variable.Name))
@@ -138,10 +221,63 @@ public sealed class ContainerDefinition
             },
         };
 
+        host.CapAdd = Capabilities
+            .Where(capability => !string.IsNullOrWhiteSpace(capability))
+            .Select(capability => capability.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        host.SecurityOpt = SecurityOptions
+            .Where(option => !string.IsNullOrWhiteSpace(option))
+            .Select(option => option.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
         parameters.HostConfig = host;
 
         return parameters;
     }
+
+    /// <summary>Clears what the old container had only from its image, so the new one's image decides.</summary>
+    private static void LeaveToImage(CreateContainerParameters parameters, DockerOCIImageConfig image)
+    {
+        if (SameList(parameters.Entrypoint, image.Entrypoint))
+            parameters.Entrypoint = null;
+
+        if ((parameters.WorkingDir ?? "") == (image.WorkingDir ?? ""))
+            parameters.WorkingDir = null;
+
+        if ((parameters.StopSignal ?? "") == (image.StopSignal ?? ""))
+            parameters.StopSignal = null;
+
+        if (SameList(parameters.Shell, image.Shell))
+            parameters.Shell = null;
+
+        if (SameList(parameters.OnBuild, image.OnBuild))
+            parameters.OnBuild = null;
+
+        if (parameters.Healthcheck != null && JsonSerializer.Serialize(parameters.Healthcheck) == JsonSerializer.Serialize(image.Healthcheck))
+            parameters.Healthcheck = null;
+
+        // Labels and volumes are merged with the image's, so only the container's own are kept. The
+        // image's volumes are still mounted: every mount is named in the binds
+        if (parameters.Labels != null && image.Labels != null)
+        {
+            parameters.Labels = parameters.Labels
+                .Where(label => !(image.Labels.TryGetValue(label.Key, out var value) && value == label.Value))
+                .ToDictionary(label => label.Key, label => label.Value);
+        }
+
+        if (parameters.Volumes != null && image.Volumes != null)
+        {
+            parameters.Volumes = parameters.Volumes
+                .Where(volume => !image.Volumes.ContainsKey(volume.Key))
+                .ToDictionary(volume => volume.Key, volume => volume.Value);
+        }
+    }
+
+    private static bool SameList(IList<string>? a, IList<string>? b) =>
+        (a ?? []).SequenceEqual(b ?? [], StringComparer.Ordinal);
 
     /// <exception cref="ArgumentException">Something the container can't be created with.</exception>
     public void Validate()
@@ -167,6 +303,18 @@ public sealed class ContainerDefinition
                 throw new ArgumentException($"The environment variable \"{variable.Name}\" can't have '=' in its name.");
         }
     }
+}
+
+/// <summary>What a container's image sets, which the container has unless it sets otherwise.</summary>
+public sealed class ImageDefaults
+{
+    public IReadOnlyList<EnvironmentVariable> Environment { get; init; } = [];
+
+    /// <summary>The image's command, as a command line; empty if it has none.</summary>
+    public string Command { get; init; } = "";
+
+    /// <summary>The user the image runs as; empty for root.</summary>
+    public string User { get; init; } = "";
 }
 
 public sealed class EnvironmentVariable

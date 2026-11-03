@@ -16,7 +16,7 @@ else if (_spec is { } spec)
     <Form Model="spec" OnSubmit="ApplyAsync" Class="edit-form">
         <Alert Info>
             Docker can't change these on an existing container, so applying them replaces it: the old container is stopped, a new one is created with the same volumes, and it's started again if it was running.
-            Anything not shown here, such as its network, user and limits, is kept.
+            Anything not shown here, such as its network and limits, is kept; what it only has from its image follows the image.
         </Alert>
 
         <div class="edit-form-pair">
@@ -29,8 +29,23 @@ else if (_spec is { } spec)
         </div>
 
         <FormItem Label="Command" Class="edit-form-mono" Help="Arguments for the image's entry point. Leave empty to use the image's own.">
-            <TextInput @bind-Value="spec.Command" />
+            <TextInput @bind-Value="spec.Command" Placeholder="@spec.Defaults?.Command" />
         </FormItem>
+
+        <div class="edit-form-pair">
+            <FormItem Label="Run as" Class="edit-form-mono" Help="The user the image's entry point runs as. LANCommander's server images start as root and switch to their own user for the server.">
+                <TextInput @bind-Value="spec.User" Placeholder="@(spec.Defaults is { User: { Length: > 0 } user } ? user : "The image's user")" />
+            </FormItem>
+            <FormItem Label="Privileges">
+                <Flex Vertical Gap="Gap.Small">
+                    <Checkbox @bind-Value="spec.CanMountOverlay">Allow mounting file systems (SYS_ADMIN, AppArmor unconfined), as LANCommander's server images need for their overlay</Checkbox>
+                    @if (OtherPrivileges(spec) is { Length: > 0 } others)
+                    {
+                        <Typography Secondary Small>Also kept: <Typography Code>@others</Typography></Typography>
+                    }
+                </Flex>
+            </FormItem>
+        </div>
 
         <div class="edit-form-pair">
             <FormItem Label="Restart policy" Help="What Docker does when the container exits. LANCommander's own autostart works with any of these.">
@@ -63,18 +78,30 @@ else if (_spec is { } spec)
             </Flex>
         </FormItem>
 
-        <FormItem Label="Environment" Help="Includes the variables the image sets.">
+        <FormItem Label="Environment" Help="@(spec.Defaults == null ? "Includes the variables the image sets: the image the container was created from is no longer on the host, so they can't be told apart." : "The variables this container sets. The image's own are used for the rest, and follow the image when it's updated.")">
             <Flex Vertical Gap="Gap.Small">
                 @foreach (var variable in spec.Environment)
                 {
                     <Flex Gap="Gap.Small" Align="Align.Center">
                         <TextInput @bind-Value="variable.Name" Placeholder="NAME" />
                         <span aria-hidden="true">=</span>
-                        <TextInput @bind-Value="variable.Value" />
-                        <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => spec.Environment.Remove(variable)" />
+                        <TextInput @bind-Value="variable.Value" Placeholder="@DefaultOf(spec, variable.Name)" />
+                        <Button Text Danger Icon="IconType.X" title="@(DefaultOf(spec, variable.Name) != null ? "Use the image's" : "Remove")" OnClick="() => spec.Environment.Remove(variable)" />
                     </Flex>
                 }
                 <Button Icon="IconType.Plus" OnClick="() => spec.Environment.Add(new EnvironmentVariable())">Add Variable</Button>
+
+                @if (ImageVariables(spec) is { Count: > 0 } defaults)
+                {
+                    <Typography Secondary Small>From the image</Typography>
+                    @foreach (var variable in defaults)
+                    {
+                        <Flex Gap="Gap.Small" Align="Align.Center">
+                            <Typography Code>@variable.Name=@variable.Value</Typography>
+                            <Button Small Text title="Set it for this container" OnClick="() => spec.Environment.Add(new EnvironmentVariable { Name = variable.Name, Value = variable.Value })">Change</Button>
+                        </Flex>
+                    }
+                }
             </Flex>
         </FormItem>
 
@@ -156,7 +183,7 @@ else if (_spec is { } spec)
             if (container == null)
                 _error = $"The host has no container \"{Settings.ContainerId}\". Choose another on the server's General page.";
             else
-                _spec = ContainerDefinition.From(container);
+                _spec = await Containers.DefinitionOfAsync(hostId, container);
         }
         catch (Exception ex)
         {
@@ -167,6 +194,18 @@ else if (_spec is { } spec)
             _loading = false;
         }
     }
+
+    /// <summary>The image's value for a variable, if it sets one.</summary>
+    static string? DefaultOf(ContainerDefinition spec, string name) =>
+        spec.Defaults?.Environment.FirstOrDefault(v => v.Name == name.Trim())?.Value;
+
+    /// <summary>The image's variables the container doesn't set itself.</summary>
+    static IReadOnlyList<EnvironmentVariable> ImageVariables(ContainerDefinition spec) =>
+        spec.Defaults?.Environment
+            .Where(d => d.Name != "PATH" && spec.Environment.All(v => v.Name.Trim() != d.Name))
+            .ToList() ?? [];
+
+    static string OtherPrivileges(ContainerDefinition spec) => string.Join(", ", spec.OtherPrivileges);
 
     async Task ApplyAsync()
     {
