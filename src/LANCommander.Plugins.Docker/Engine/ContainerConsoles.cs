@@ -21,17 +21,188 @@ internal sealed class ContainerConsoles(DockerHosts hosts)
     // Tries bash first, for its line editing, and falls back on the sh every image has
     private static readonly string[] ShellCommand = ["/bin/sh", "-c", "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"];
 
+    /// <summary>A log file's console's id: this, then the file's path in the container.</summary>
+    public const string FilePrefix = "file:";
+
+    // Lines of a log file shown before following it, when the request doesn't say
+    private const int DefaultTail = 500;
+
+    // Shows the end of the file ($1, its last $2 lines), then follows it by name, so a log the server
+    // rotates or makes again is still followed. Docker leaves an exec running when its connection
+    // closes, so tail runs in the background and is ended when the input does, which closing the
+    // console closes
+    private const string FollowScript =
+        """
+        tail -n "$2" -F -- "$1" & t=$!
+        cat >/dev/null
+        kill "$t" 2>/dev/null
+        """;
+
+    private const string TailScript = """exec tail -n "$2" -- "$1" """;
+
     public static IReadOnlyList<ServerEngineConsole> For(DockerServerSettings settings) =>
         settings.HostId == null || string.IsNullOrWhiteSpace(settings.ContainerId)
             ? []
             :
             [
                 new(LogId, "Container log", ServerEngineConsoleKind.Log),
+                .. LogFilesOf(settings).Select(file => new ServerEngineConsole(FilePrefix + file.Path.Trim(), string.IsNullOrWhiteSpace(file.Name) ? file.Path.Trim() : file.Name.Trim(), ServerEngineConsoleKind.Log)),
                 new(AttachId, "Attach", ServerEngineConsoleKind.Terminal),
                 new(ShellId, "Shell", ServerEngineConsoleKind.Terminal),
             ];
 
-    public async IAsyncEnumerable<ServerEngineLogLine> ReadLogAsync(DockerServerSettings settings, ServerEngineLogRequest request, [EnumeratorCancellation] CancellationToken cancellationToken)
+    private static IEnumerable<ContainerLogFile> LogFilesOf(DockerServerSettings settings) =>
+        (settings.LogFiles ?? [])
+            .Where(file => !string.IsNullOrWhiteSpace(file.Path))
+            .DistinctBy(file => file.Path.Trim());
+
+    public IAsyncEnumerable<ServerEngineLogLine> ReadLogAsync(DockerServerSettings settings, string consoleId, ServerEngineLogRequest request, CancellationToken cancellationToken)
+    {
+        if (!consoleId.StartsWith(FilePrefix, StringComparison.Ordinal))
+            return ReadContainerLogAsync(settings, request, cancellationToken);
+
+        var path = consoleId[FilePrefix.Length..];
+
+        // Only the files the server's settings name, not whichever a console id might
+        if (LogFilesOf(settings).All(file => file.Path.Trim() != path))
+            throw new DockerHostException($"{path} isn't one of the server's log files.");
+
+        return ReadLogFileAsync(settings, path, request, cancellationToken);
+    }
+
+    private async IAsyncEnumerable<ServerEngineLogLine> ReadLogFileAsync(DockerServerSettings settings, string path, ServerEngineLogRequest request, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var client = hosts.GetClient(settings.HostId);
+        var container = await OrNotFound(() => client.Containers.InspectContainerAsync(settings.ContainerId, cancellationToken), settings);
+        var tail = request.Tail ?? DefaultTail;
+
+        // Commands only run in a running container; a stopped one's file is copied out as it was left
+        if (container.State is not { Running: true })
+        {
+            foreach (var line in await ReadStoppedAsync(client, container.ID, path, tail, cancellationToken))
+                yield return line;
+
+            yield break;
+        }
+
+        var exec = await client.Exec.CreateContainerExecAsync(container.ID, new ContainerExecCreateParameters
+        {
+            AttachStdin = request.Follow,
+            AttachStdout = true,
+            AttachStderr = true,
+            Cmd = ["sh", "-c", request.Follow ? FollowScript : TailScript, "sh", path, tail.ToString(CultureInfo.InvariantCulture)],
+        }, cancellationToken);
+
+        using var stream = await client.Exec.StartContainerExecAsync(exec.ID, new ContainerExecStartParameters(), cancellationToken);
+
+        try
+        {
+            await foreach (var line in ReadLinesAsync(stream, cancellationToken))
+                yield return line;
+        }
+        finally
+        {
+            // Ends the input, and so the tail following the file
+            if (request.Follow)
+            {
+                try
+                {
+                    stream.CloseWrite();
+                }
+                catch (Exception)
+                {
+                    // The connection is already gone, which ends it too
+                }
+            }
+        }
+    }
+
+    /// <summary>The end of a stopped container's file, copied out of it through Docker's archive API.</summary>
+    private static async Task<IReadOnlyList<ServerEngineLogLine>> ReadStoppedAsync(DockerClient client, string container, string path, int tail, CancellationToken cancellationToken)
+    {
+        ContainerArchiveResponse archive;
+
+        try
+        {
+            archive = await client.Containers.GetArchiveFromContainerAsync(container, new ContainerPathStatParameters { Path = path }, statOnly: false, cancellationToken);
+        }
+        catch (DockerApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return [new ServerEngineLogLine($"{path} isn't in the stopped container. Files in an overlay mounted while it runs, such as /config/Merged, can only be read then; its files on disk, such as /config/Overlay, can be read now.", null, true)];
+        }
+
+        using (archive.Stream)
+        {
+            var reader = new System.Formats.Tar.TarReader(archive.Stream);
+            var entry = await reader.GetNextEntryAsync(copyData: false, cancellationToken);
+
+            if (entry?.DataStream == null)
+                return [new ServerEngineLogLine($"{path} isn't a file.", null, true)];
+
+            return TailOf(entry.DataStream, tail);
+        }
+    }
+
+    /// <summary>The last lines of a stream of text.</summary>
+    internal static IReadOnlyList<ServerEngineLogLine> TailOf(Stream stream, int tail)
+    {
+        var lines = new Queue<ServerEngineLogLine>();
+        var reader = new LineReader(line =>
+        {
+            lines.Enqueue(new ServerEngineLogLine(line, null, false));
+
+            if (lines.Count > tail)
+                lines.Dequeue();
+        });
+
+        var buffer = new byte[16 * 1024];
+        int read;
+
+        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            reader.Append(buffer, read);
+
+        reader.Flush();
+
+        return tail <= 0 ? [] : lines.ToList();
+    }
+
+    /// <summary>A command's output as log lines, its error output marked as errors.</summary>
+    private static async IAsyncEnumerable<ServerEngineLogLine> ReadLinesAsync(MultiplexedStream stream, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var buffer = new byte[16 * 1024];
+        var pending = new List<ServerEngineLogLine>();
+        var readers = new Dictionary<MultiplexedStream.TargetStream, LineReader>();
+
+        while (true)
+        {
+            var read = await stream.ReadOutputAsync(buffer, 0, buffer.Length, cancellationToken);
+
+            if (read.EOF)
+                break;
+
+            if (!readers.TryGetValue(read.Target, out var reader))
+            {
+                var isError = read.Target == MultiplexedStream.TargetStream.StandardError;
+
+                readers[read.Target] = reader = new LineReader(line => pending.Add(new ServerEngineLogLine(line, null, isError)));
+            }
+
+            reader.Append(buffer, read.Count);
+
+            foreach (var line in pending)
+                yield return line;
+
+            pending.Clear();
+        }
+
+        foreach (var reader in readers.Values)
+            reader.Flush();
+
+        foreach (var line in pending)
+            yield return line;
+    }
+
+    private async IAsyncEnumerable<ServerEngineLogLine> ReadContainerLogAsync(DockerServerSettings settings, ServerEngineLogRequest request, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var client = hosts.GetClient(settings.HostId);
 

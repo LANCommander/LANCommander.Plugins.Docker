@@ -207,6 +207,32 @@ public sealed class PageTests : BunitContext
     }
 
     [Fact]
+    public async Task LogFilesAreKeptWithTheServer()
+    {
+        _server = _server with
+        {
+            Settings = ServerEngineSettings.Write(new DockerServerSettings
+            {
+                HostId = Guid.NewGuid(),
+                ContainerId = "deusex",
+                LogFiles = [new ContainerLogFile { Name = "Server log", Path = "/config/Overlay/System/server.log" }],
+            }),
+        };
+
+        var editor = Render<DockerServerEditor>(parameters => parameters.Add(p => p.Context, Context()));
+
+        Assert.Contains("/config/Overlay/System/server.log", editor.FindAll("input").Select(i => i.GetAttribute("value")));
+
+        await editor.FindAll("button").Single(b => b.TextContent.Trim() == "Add Log File").ClickAsync(new());
+        await editor.FindAll("button").First(b => b.GetAttribute("title") == "Remove").ClickAsync(new());
+
+        // The new one is left, empty
+        var file = Assert.Single(_server.GetSettings<DockerServerSettings>().LogFiles);
+
+        Assert.Equal("", file.Path);
+    }
+
+    [Fact]
     public void TheContainerPageAsksForAContainerFirst()
     {
         var page = Render<ContainerSection>(parameters => parameters.Add(p => p.Server, new ServerEngineServer { Id = Guid.NewGuid() }));

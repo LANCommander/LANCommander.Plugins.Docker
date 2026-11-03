@@ -150,6 +150,66 @@ public sealed class DockerEngineTests : IAsyncLifetime
     }
 
     [DockerFact]
+    public async Task ALogFileIsFollowedWhileRunningAndReadWhenStopped()
+    {
+        var server = await AddServerAsync("sh -c 'mkdir -p /srv; echo first > /srv/server.log; echo second >> /srv/server.log; sleep 600'");
+        var console = ContainerConsoles.FilePrefix + "/srv/server.log";
+
+        server = server with { Settings = ServerEngineSettings.Write(new DockerServerSettings { HostId = _host.Id, ContainerId = _name, LogFiles = [new ContainerLogFile { Name = "Server", Path = "/srv/server.log" }] }) };
+
+        await _engine.StartAsync(server, CancellationToken.None);
+
+        var client = _hosts.GetClient(_host.Id);
+
+        // Followed: the end of the file, then what's written after
+        using (var following = new CancellationTokenSource(TimeSpan.FromSeconds(30)))
+        {
+            var lines = new List<string>();
+
+            await foreach (var line in _engine.ReadLogAsync(server, console, new ServerEngineLogRequest(Follow: true, Tail: 1), following.Token))
+            {
+                lines.Add(line.Text);
+
+                if (lines.Count == 1)
+                {
+                    var exec = await client.Exec.CreateContainerExecAsync(_name, new ContainerExecCreateParameters { Cmd = ["sh", "-c", "echo third >> /srv/server.log"] }, CancellationToken.None);
+
+                    await client.Exec.StartContainerExecAsync(exec.ID, new ContainerExecStartParameters(), CancellationToken.None);
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            Assert.Equal(["second", "third"], lines);
+        }
+
+        // Closing the console ends the tail following it
+        await TestHosts.WaitUntilAsync(() => !ProcessesAsync(client).GetAwaiter().GetResult().Contains("tail"), "the tail to end");
+
+        // Stopped, it's copied out as it was left
+        await _engine.StopAsync(server, CancellationToken.None);
+
+        var stopped = new List<ServerEngineLogLine>();
+
+        await foreach (var line in _engine.ReadLogAsync(server, console, new ServerEngineLogRequest(Follow: true, Tail: 2), CancellationToken.None))
+            stopped.Add(line);
+
+        Assert.Equal(["second", "third"], stopped.Select(l => l.Text));
+    }
+
+    /// <summary>What the test container is running, as busybox's ps lists it.</summary>
+    private async Task<string> ProcessesAsync(DockerClient client)
+    {
+        var exec = await client.Exec.CreateContainerExecAsync(_name, new ContainerExecCreateParameters { Cmd = ["ps"], AttachStdout = true }, CancellationToken.None);
+
+        using var stream = await client.Exec.StartContainerExecAsync(exec.ID, new ContainerExecStartParameters(), CancellationToken.None);
+
+        return (await stream.ReadOutputToEndAsync(CancellationToken.None)).stdout;
+    }
+
+    [DockerFact]
     public async Task AShellIsOpenedInTheRunningContainer()
     {
         var server = await AddServerAsync("sleep 600");

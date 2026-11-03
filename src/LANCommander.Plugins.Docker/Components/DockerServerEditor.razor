@@ -36,6 +36,24 @@
     <TextInput Value="@Settings.FilesPath" ValueChanged="SetFilesPath" Disabled="string.IsNullOrWhiteSpace(Settings.ContainerId)" Placeholder="@(String.IsNullOrWhiteSpace(_workingDirectory) ? "/" : _workingDirectory)" />
 </FormItem>
 
+<FormItem Label="Log files" Class="edit-form-mono" Help="Log files the server writes in its container, each shown as a console under its Monitor. While the server runs they're followed as they're written; while it's stopped, the end of each is shown as it was left, which only works for files on disk: with LANCommander's server images, under /config/Overlay rather than /config/Merged.">
+    <Flex Vertical Gap="Gap.Small">
+        @{ var logFiles = Settings.LogFiles; }
+        @for (var i = 0; i < logFiles.Count; i++)
+        {
+            var index = i;
+            var file = logFiles[i];
+
+            <Flex Gap="Gap.Small" Align="Align.Center">
+                <TextInput Value="@file.Name" ValueChanged="(string? name) => SetLogFile(index, name, null)" Placeholder="Server log" />
+                <TextInput Value="@file.Path" ValueChanged="(string? path) => SetLogFile(index, null, path)" Placeholder="/config/Overlay/System/server.log" />
+                <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => ChangeLogFiles(files => { if (index < files.Count) files.RemoveAt(index); })" />
+            </Flex>
+        }
+        <Button Icon="IconType.Plus" Disabled="string.IsNullOrWhiteSpace(Settings.ContainerId)" OnClick="AddLogFile">Add Log File</Button>
+    </Flex>
+</FormItem>
+
 @if (_creating is { } creating && Settings.HostId is { } creatingOn)
 {
     <Card Title="Create a container" Subtitle="@(_draft == null ? "The image is pulled and read, to fill in its ports, volumes and settings" : "Filled in from the image; check the ports before creating it")">
@@ -213,6 +231,30 @@
         settings.FilesPath = string.IsNullOrWhiteSpace(path) ? null : path.Trim();
         Context.SetSettings(settings);
     }
+
+    // The settings are read afresh each time, so a log file is found again by where it is in the list
+    void ChangeLogFiles(Action<List<ContainerLogFile>> change)
+    {
+        var settings = Settings;
+
+        change(settings.LogFiles);
+        Context.SetSettings(settings);
+    }
+
+    void AddLogFile() => ChangeLogFiles(files => files.Add(new ContainerLogFile()));
+
+    /// <summary>Changes the log file's name or path, whichever is given.</summary>
+    void SetLogFile(int index, string? name, string? path) => ChangeLogFiles(files =>
+    {
+        if (index >= files.Count)
+            return;
+
+        files[index] = new ContainerLogFile
+        {
+            Name = name?.Trim() ?? files[index].Name,
+            Path = path?.Trim() ?? files[index].Path,
+        };
+    });
 
     async Task LoadContainersAsync()
     {

@@ -22,6 +22,57 @@ public sealed class ContainerConsoleTests
     }
 
     [Fact]
+    public void EachLogFileIsAConsoleBesideTheContainersLog()
+    {
+        var consoles = ContainerConsoles.For(new DockerServerSettings
+        {
+            HostId = Guid.NewGuid(),
+            ContainerId = "deusex",
+            LogFiles =
+            [
+                new ContainerLogFile { Name = "Server log", Path = "/config/Overlay/System/server.log" },
+                new ContainerLogFile { Name = "", Path = " /config/Overlay/System/ucc.log " },
+                new ContainerLogFile { Name = "Twice", Path = "/config/Overlay/System/server.log" },
+                new ContainerLogFile { Name = "No path", Path = "" },
+            ],
+        });
+
+        Assert.Equal(
+        [
+            new ServerEngineConsole("log", "Container log", ServerEngineConsoleKind.Log),
+            new ServerEngineConsole("file:/config/Overlay/System/server.log", "Server log", ServerEngineConsoleKind.Log),
+            new ServerEngineConsole("file:/config/Overlay/System/ucc.log", "/config/Overlay/System/ucc.log", ServerEngineConsoleKind.Log),
+            new ServerEngineConsole("attach", "Attach", ServerEngineConsoleKind.Terminal),
+            new ServerEngineConsole("shell", "Shell", ServerEngineConsoleKind.Terminal),
+        ], consoles);
+    }
+
+    [Fact]
+    public void OnlyTheServersOwnLogFilesAreRead()
+    {
+        var consoles = new ContainerConsoles(TestHosts.Create());
+        var settings = new DockerServerSettings { HostId = Guid.NewGuid(), ContainerId = "deusex", LogFiles = [new ContainerLogFile { Path = "/config/Overlay/System/server.log" }] };
+
+        var error = Assert.Throws<LANCommander.Plugins.Docker.Hosts.DockerHostException>(() =>
+            consoles.ReadLogAsync(settings, "file:/etc/shadow", new ServerEngineLogRequest(Follow: false), CancellationToken.None));
+
+        Assert.Contains("isn't one of the server's log files", error.Message);
+    }
+
+    [Theory]
+    [InlineData("one\ntwo\nthree\nfour\n", 2, new[] { "three", "four" })]
+    [InlineData("one\r\ntwo", 5, new[] { "one", "two" })]
+    [InlineData("", 5, new string[0])]
+    [InlineData("one\ntwo", 0, new string[0])]
+    public void TheEndOfAFileIsItsLastLines(string text, int tail, string[] lines)
+    {
+        var read = ContainerConsoles.TailOf(new MemoryStream(Encoding.UTF8.GetBytes(text)), tail);
+
+        Assert.Equal(lines, read.Select(l => l.Text));
+        Assert.All(read, l => Assert.False(l.IsError));
+    }
+
+    [Fact]
     public void AServerNotSetUpYetOffersNone()
     {
         Assert.Empty(ContainerConsoles.For(new DockerServerSettings()));

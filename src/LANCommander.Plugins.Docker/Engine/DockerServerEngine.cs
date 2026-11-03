@@ -198,7 +198,7 @@ public sealed class DockerServerEngine(
         ContainerConsoles.For(server.GetSettings<DockerServerSettings>());
 
     public IAsyncEnumerable<ServerEngineLogLine> ReadLogAsync(ServerEngineServer server, string consoleId, ServerEngineLogRequest request, CancellationToken cancellationToken) =>
-        _consoles.ReadLogAsync(server.GetSettings<DockerServerSettings>(), request, cancellationToken);
+        _consoles.ReadLogAsync(server.GetSettings<DockerServerSettings>(), consoleId, request, cancellationToken);
 
     public Task<IServerEngineTerminal> OpenTerminalAsync(ServerEngineServer server, string consoleId, ServerEngineTerminalSize size, CancellationToken cancellationToken) =>
         _consoles.OpenAsync(server.GetSettings<DockerServerSettings>(), consoleId, size, cancellationToken);

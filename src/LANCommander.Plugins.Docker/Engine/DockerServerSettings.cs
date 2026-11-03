@@ -20,4 +20,21 @@ public sealed class DockerServerSettings
     /// container's working directory.
     /// </summary>
     public string? FilesPath { get; set; }
+
+    /// <summary>Log files in the container to show as consoles beside its own log, as the server writes them.</summary>
+    public List<ContainerLogFile> LogFiles { get; set; } = [];
+}
+
+/// <summary>A log file the server writes in its container.</summary>
+public sealed class ContainerLogFile
+{
+    /// <summary>What its console is called, e.g. <c>Server log</c>.</summary>
+    public string Name { get; set; } = "";
+
+    /// <summary>
+    /// Where it is in the container, e.g. <c>/config/Overlay/System/server.log</c>. A stopped
+    /// container's files are only read where they're on disk: in a volume, not in an overlay that's
+    /// only mounted while it runs.
+    /// </summary>
+    public string Path { get; set; } = "";
 }
