@@ -70,7 +70,7 @@ public sealed class DockerHosts(IPluginSettings<DockerSettings> settings, ILogge
         settings.Update(s =>
         {
             s.Hosts.RemoveAll(h => h.Id == host.Id);
-            s.Hosts.Add(new DockerHost { Id = host.Id, Name = host.Name.Trim(), Address = host.Address.Trim() });
+            s.Hosts.Add(new DockerHost { Id = host.Id, Name = host.Name.Trim(), Address = host.Address.Trim(), DataFolder = host.DataFolder?.Trim() ?? "" });
         });
     }
 

@@ -1,4 +1,4 @@
-@* A server's Container page: the container's image, command, environment, ports and volumes *@
+@* A server's Container page: the container's image, command, network, ports, environment and volumes *@
 @inject ContainerService Containers
 @inject IServerProvider Servers
 @inject NotificationService Notifications
@@ -11,127 +11,38 @@ else if (_error != null)
 {
     <Alert Danger Title="The container could not be read">@_error</Alert>
 }
-else if (_spec is { } spec)
+else if (_spec is { } spec && Settings.HostId is { } hostId)
 {
     <Form Model="spec" OnSubmit="ApplyAsync" Class="edit-form">
         <Alert Info>
             Docker can't change these on an existing container, so applying them replaces it: the old container is stopped, a new one is created with the same volumes, and it's started again if it was running.
-            Anything not shown here, such as its network and limits, is kept; what it only has from its image follows the image.
+            Anything not shown here, such as its limits, is kept; what it only has from its image follows the image.
         </Alert>
 
-        <div class="edit-form-pair">
-            <FormItem Label="Name" Class="edit-form-mono">
-                <TextInput @bind-Value="spec.Name" />
-            </FormItem>
-            <FormItem Label="Image" Class="edit-form-mono" Help="Pulled if the host doesn't have it. A newer image under the same tag is only used once pulled.">
-                <TextInput @bind-Value="spec.Image" />
-            </FormItem>
-        </div>
-
-        <FormItem Label="Command" Class="edit-form-mono" Help="Arguments for the image's entry point. Leave empty to use the image's own.">
-            <TextInput @bind-Value="spec.Command" Placeholder="@spec.Defaults?.Command" />
-        </FormItem>
-
-        <div class="edit-form-pair">
-            <FormItem Label="Run as" Class="edit-form-mono" Help="The user the image's entry point runs as. LANCommander's server images start as root and switch to their own user for the server.">
-                <TextInput @bind-Value="spec.User" Placeholder="@(spec.Defaults is { User: { Length: > 0 } user } ? user : "The image's user")" />
-            </FormItem>
-            <FormItem Label="Privileges">
-                <Flex Vertical Gap="Gap.Small">
-                    <Checkbox @bind-Value="spec.CanMountOverlay">Allow mounting file systems (SYS_ADMIN, AppArmor unconfined), as LANCommander's server images need for their overlay</Checkbox>
-                    @if (OtherPrivileges(spec) is { Length: > 0 } others)
-                    {
-                        <Typography Secondary Small>Also kept: <Typography Code>@others</Typography></Typography>
-                    }
-                </Flex>
-            </FormItem>
-        </div>
-
-        <div class="edit-form-pair">
-            <FormItem Label="Restart policy" Help="What Docker does when the container exits. LANCommander's own autostart works with any of these.">
-                <Select TValue="string" Items="RestartItems" @bind-Value="spec.RestartPolicy" />
-            </FormItem>
-            <FormItem Label="Console">
-                <Flex Vertical Gap="Gap.Small">
-                    <Checkbox @bind-Value="spec.Interactive">Keep standard input open, so commands can be sent from the Monitor</Checkbox>
-                    <Checkbox @bind-Value="spec.Terminal">Give the container a terminal</Checkbox>
-                </Flex>
-            </FormItem>
-        </div>
-
-        <Divider Class="edit-form-divider" />
-
-        <FormItem Label="Ports" Help="Ports the container listens on, and the host ports players reach them on. Leave the host port empty to not publish one.">
-            <Flex Vertical Gap="Gap.Small">
-                @foreach (var port in spec.Ports)
-                {
-                    <Flex Gap="Gap.Small" Align="Align.Center">
-                        <NumberInput TValue="int?" @bind-Value="port.HostPort" Min="1" Max="65535" Placeholder="Host port" />
-                        <span aria-hidden="true">→</span>
-                        <NumberInput TValue="int" @bind-Value="port.ContainerPort" Min="1" Max="65535" />
-                        <Select TValue="string" Items="ProtocolItems" @bind-Value="port.Protocol" />
-                        <TextInput @bind-Value="port.HostIp" Placeholder="Every address" />
-                        <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => spec.Ports.Remove(port)" />
-                    </Flex>
-                }
-                <Button Icon="IconType.Plus" OnClick="() => spec.Ports.Add(new PortMapping())">Add Port</Button>
-            </Flex>
-        </FormItem>
-
-        <FormItem Label="Environment" Help="@(spec.Defaults == null ? "Includes the variables the image sets: the image the container was created from is no longer on the host, so they can't be told apart." : "The variables this container sets. The image's own are used for the rest, and follow the image when it's updated.")">
-            <Flex Vertical Gap="Gap.Small">
-                @foreach (var variable in spec.Environment)
-                {
-                    <Flex Gap="Gap.Small" Align="Align.Center">
-                        <TextInput @bind-Value="variable.Name" Placeholder="NAME" />
-                        <span aria-hidden="true">=</span>
-                        <TextInput @bind-Value="variable.Value" Placeholder="@DefaultOf(spec, variable.Name)" />
-                        <Button Text Danger Icon="IconType.X" title="@(DefaultOf(spec, variable.Name) != null ? "Use the image's" : "Remove")" OnClick="() => spec.Environment.Remove(variable)" />
-                    </Flex>
-                }
-                <Button Icon="IconType.Plus" OnClick="() => spec.Environment.Add(new EnvironmentVariable())">Add Variable</Button>
-
-                @if (ImageVariables(spec) is { Count: > 0 } defaults)
-                {
-                    <Typography Secondary Small>From the image</Typography>
-                    @foreach (var variable in defaults)
-                    {
-                        <Flex Gap="Gap.Small" Align="Align.Center">
-                            <Typography Code>@variable.Name=@variable.Value</Typography>
-                            <Button Small Text title="Set it for this container" OnClick="() => spec.Environment.Add(new EnvironmentVariable { Name = variable.Name, Value = variable.Value })">Change</Button>
-                        </Flex>
-                    }
-                }
-            </Flex>
-        </FormItem>
-
-        <FormItem Label="Volumes" Help="A folder on the Docker host, or a volume's name, and where it appears in the container. Volumes Docker made without a name are listed by their id, so the new container keeps them.">
-            <Flex Vertical Gap="Gap.Small">
-                @foreach (var mount in spec.Mounts)
-                {
-                    <Flex Gap="Gap.Small" Align="Align.Center">
-                        <TextInput @bind-Value="mount.Source" Placeholder="/srv/game or a volume" />
-                        <span aria-hidden="true">→</span>
-                        <TextInput @bind-Value="mount.Destination" Placeholder="/data" />
-                        <Checkbox @bind-Value="mount.ReadOnly">Read only</Checkbox>
-                        <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => spec.Mounts.Remove(mount)" />
-                    </Flex>
-                }
-                <Button Icon="IconType.Plus" OnClick="() => spec.Mounts.Add(new VolumeMount())">Add Volume</Button>
-            </Flex>
-        </FormItem>
+        <ContainerForm @ref="_form" Spec="spec" HostId="hostId" Container="@Settings.ContainerId" />
 
         @if (_progress != null)
         {
             <Typography Secondary>@_progress</Typography>
         }
 
+        <GameFilesLog Lines="_gameFilesLog" OnClose="() => _gameFilesLog = []" />
+
         <FormItem>
             <Flex Gap="Gap.Small">
                 <Popconfirm OnConfirm="ApplyAsync" Title="Replace the container?" Description="It is stopped while it's replaced, and started again if it was running." OkText="Replace">
-                    <Button Primary Loading="_applying">Apply</Button>
+                    <Button Primary Loading="_applying" Disabled="Busy && !_applying">Apply</Button>
                 </Popconfirm>
-                <Button Disabled="_applying" OnClick="LoadAsync">Discard</Button>
+                <Popconfirm OnConfirm="UpdateImageAsync" Title="Update the image?" Description="The image is pulled again. If that brings a newer one, the container is replaced to use it, with the settings above." OkText="Update">
+                    <Button Icon="IconType.ArrowClockwise" Loading="_updating" Disabled="Busy && !_updating">Update Image</Button>
+                </Popconfirm>
+                @if (spec.GameFiles != null)
+                {
+                    <Popconfirm OnConfirm="UpdateGameFilesAsync" Title="Update the game files?" Description="@($"Every server sharing {spec.GameFiles.Source} is stopped while the image installs or updates the game there, then started again if it was running.")" OkText="Update">
+                        <Button Icon="IconType.DownloadSimple" Loading="_updatingFiles" Disabled="Busy && !_updatingFiles">Update Game Files</Button>
+                    </Popconfirm>
+                }
+                <Button Disabled="Busy" OnClick="LoadAsync">Discard</Button>
             </Flex>
         </FormItem>
     </Form>
@@ -140,19 +51,22 @@ else if (_spec is { } spec)
 @code {
     [Parameter, EditorRequired] public ServerEngineServer Server { get; set; } = default!;
 
-    static readonly IEnumerable<SelectItem<string>> RestartItems = ContainerDefinition.RestartPolicies.Select(p => new SelectItem<string>(p, p)).ToList();
-    static readonly IEnumerable<SelectItem<string>> ProtocolItems = [new("udp", "UDP"), new("tcp", "TCP")];
-
     // The server's settings as this page last saw or wrote them; the page's parameter is the server
     // as its editor loaded it, before any container this page replaced
     DockerServerSettings Settings { get; set; } = new();
     Guid _loadedFor;
 
     ContainerDefinition? _spec;
+    ContainerForm? _form;
     bool _loading = true;
     bool _applying;
+    bool _updating;
+    bool _updatingFiles;
+    IReadOnlyList<string> _gameFilesLog = [];
     string? _error;
     string? _progress;
+
+    bool Busy => _applying || _updating || _updatingFiles;
 
     protected override async Task OnParametersSetAsync()
     {
@@ -195,62 +109,124 @@ else if (_spec is { } spec)
         }
     }
 
-    /// <summary>The image's value for a variable, if it sets one.</summary>
-    static string? DefaultOf(ContainerDefinition spec, string name) =>
-        spec.Defaults?.Environment.FirstOrDefault(v => v.Name == name.Trim())?.Value;
-
-    /// <summary>The image's variables the container doesn't set itself.</summary>
-    static IReadOnlyList<EnvironmentVariable> ImageVariables(ContainerDefinition spec) =>
-        spec.Defaults?.Environment
-            .Where(d => d.Name != "PATH" && spec.Environment.All(v => v.Name.Trim() != d.Name))
-            .ToList() ?? [];
-
-    static string OtherPrivileges(ContainerDefinition spec) => string.Join(", ", spec.OtherPrivileges);
+    IProgress<string> Progress() => new Progress<string>(message => InvokeAsync(() =>
+    {
+        _progress = message;
+        StateHasChanged();
+    }));
 
     async Task ApplyAsync()
     {
-        if (_spec == null || Settings.HostId is not { } hostId || _applying)
+        if (_spec == null || Settings.HostId is not { } hostId || Busy)
             return;
 
         _applying = true;
 
         try
         {
-            var name = await Containers.RecreateAsync(hostId, Settings.ContainerId, _spec, new Progress<string>(message => InvokeAsync(() =>
-            {
-                _progress = message;
-                StateHasChanged();
-            })));
+            var name = await Containers.RecreateAsync(hostId, Settings.ContainerId, _spec, Progress());
 
-            // The server names the container; keep it pointing at the new one
-            if (name != Settings.ContainerId && await Servers.GetAsync(Server.Id) is { } server)
-            {
-                var settings = server.EngineSettings is { Length: > 0 } saved
-                    ? ServerEngineSettings.Read<DockerServerSettings>(saved)
-                    : Settings;
-
-                settings.ContainerId = name;
-
-                await Servers.UpdateAsync(server with { EngineSettings = ServerEngineSettings.Write(settings) });
-
-                Settings = settings;
-            }
+            await ReplacedAsync(name);
 
             Notifications.Success($"{name} replaced");
-
-            _progress = null;
-
-            await LoadAsync();
         }
         catch (Exception ex)
         {
             Notifications.Error(ex, "The container could not be replaced");
-
-            _progress = null;
         }
         finally
         {
             _applying = false;
+            _progress = null;
         }
+    }
+
+    async Task UpdateImageAsync()
+    {
+        if (_spec == null || Settings.HostId is not { } hostId || Busy)
+            return;
+
+        _updating = true;
+
+        try
+        {
+            var update = await Containers.UpdateImageAsync(hostId, Settings.ContainerId, _spec, Progress());
+
+            if (update.Replaced)
+            {
+                await ReplacedAsync(update.Container);
+
+                Notifications.Success($"{update.Container} updated to the newest {_spec.Image}");
+            }
+            else
+            {
+                Notifications.Success($"{update.Container} already has the newest {_spec.Image}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, "The image could not be updated");
+        }
+        finally
+        {
+            _updating = false;
+            _progress = null;
+        }
+    }
+
+    async Task UpdateGameFilesAsync()
+    {
+        if (_spec == null || Settings.HostId is not { } hostId || Busy)
+            return;
+
+        _updatingFiles = true;
+
+        try
+        {
+            _gameFilesLog = [];
+
+            var update = await Containers.UpdateGameFilesAsync(hostId, Settings.ContainerId, Progress());
+
+            _gameFilesLog = update.Log;
+
+            Notifications.Success(update.Restarted.Count > 0
+                ? $"Game files update finished; {string.Join(", ", update.Restarted)} started again. Check its log for errors."
+                : $"Game files update finished for {string.Join(", ", update.Sharing)}. Check its log for errors.");
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, "The game files could not be updated");
+        }
+        finally
+        {
+            _updatingFiles = false;
+            _progress = null;
+        }
+
+        if (_form != null)
+            await _form.LoadUsesAsync();
+    }
+
+    /// <summary>Points the server at the container that replaced its old one, and reads it.</summary>
+    async Task ReplacedAsync(string name)
+    {
+        // The server names the container; keep it pointing at the new one
+        if (name != Settings.ContainerId && await Servers.GetAsync(Server.Id) is { } server)
+        {
+            var settings = server.EngineSettings is { Length: > 0 } saved
+                ? ServerEngineSettings.Read<DockerServerSettings>(saved)
+                : Settings;
+
+            settings.ContainerId = name;
+
+            await Servers.UpdateAsync(server with { EngineSettings = ServerEngineSettings.Write(settings) });
+
+            Settings = settings;
+        }
+
+        await LoadAsync();
+
+        if (_form != null)
+            await _form.LoadUsesAsync();
     }
 }

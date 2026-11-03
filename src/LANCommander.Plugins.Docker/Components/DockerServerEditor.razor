@@ -36,21 +36,31 @@
     <TextInput Value="@Settings.FilesPath" ValueChanged="SetFilesPath" Disabled="string.IsNullOrWhiteSpace(Settings.ContainerId)" Placeholder="@(String.IsNullOrWhiteSpace(_workingDirectory) ? "/" : _workingDirectory)" />
 </FormItem>
 
-@if (_creating is { } creating)
+@if (_creating is { } creating && Settings.HostId is { } creatingOn)
 {
-    <Card Title="Create a container" Subtitle="Its environment, ports and volumes are set on the server's Container page once the server is saved">
-        <div class="edit-form-pair">
-            <FormItem Label="Name" Class="edit-form-mono">
-                <TextInput @bind-Value="creating.Name" />
-            </FormItem>
-            <FormItem Label="Image" Class="edit-form-mono" Help="Pulled if the host doesn't have it.">
-                <TextInput Value="@creating.Image" ValueChanged="SetCreatingImage" Placeholder="lancommander/quake3:latest" />
-            </FormItem>
-        </div>
+    <Card Title="Create a container" Subtitle="@(_draft == null ? "The image is pulled and read, to fill in its ports, volumes and settings" : "Filled in from the image; check the ports before creating it")">
+        @if (_draft is { } draft)
+        {
+            <ContainerForm Spec="draft" HostId="creatingOn" ImageFixed />
 
-        <FormItem>
-            <Checkbox Value="_serverImage" ValueChanged="SetServerImage">Run it as LANCommander's server images need: as root, allowed to mount the overlay over its files (SYS_ADMIN, AppArmor unconfined)</Checkbox>
-        </FormItem>
+            @if (draft.GameFiles is { } gameFiles)
+            {
+                <FormItem Help="@(_gameFilesSharedWith.Count > 0 ? $"Already used by {string.Join(", ", _gameFilesSharedWith)}, so the game is likely installed there." : "No other server uses these game files yet. Servers sharing game files don't update them when they start, and some images then don't install them either.")">
+                    <Checkbox @bind-Value="_installGameFiles">Install the game files in @gameFiles.Source now, as Update Game Files does</Checkbox>
+                </FormItem>
+            }
+        }
+        else
+        {
+            <div class="edit-form-pair">
+                <FormItem Label="Name" Class="edit-form-mono">
+                    <TextInput @bind-Value="creating.Name" />
+                </FormItem>
+                <FormItem Label="Image" Class="edit-form-mono" Help="Pulled if the host doesn't have it. LANCommander's server images are lancommander/<game>.">
+                    <TextInput @bind-Value="creating.Image" Placeholder="lancommander/quake3:latest" />
+                </FormItem>
+            </div>
+        }
 
         @if (_progress != null)
         {
@@ -58,11 +68,21 @@
         }
 
         <Flex Gap="Gap.Small">
-            <Button Primary Loading="_creatingNow" OnClick="CreateAsync">Create</Button>
-            <Button Text OnClick="() => _creating = null">Cancel</Button>
+            @if (_draft == null)
+            {
+                <Button Primary Loading="_creatingNow" OnClick="ReadImageAsync">Next</Button>
+            }
+            else
+            {
+                <Button Primary Loading="_creatingNow" OnClick="CreateAsync">Create</Button>
+                <Button Disabled="_creatingNow" OnClick="() => _draft = null">Back</Button>
+            }
+            <Button Text Disabled="_creatingNow" OnClick="CancelCreating">Cancel</Button>
         </Flex>
     </Card>
 }
+
+<GameFilesLog Lines="_gameFilesLog" OnClose="() => _gameFilesLog = []" />
 
 @if (_container is { } container)
 {
@@ -72,7 +92,19 @@
         </Extra>
         <ChildContent>
             <Flex Vertical Gap="Gap.Small">
-                @if (container.Ports.Any(p => p.HostPort != null))
+                @if (!string.IsNullOrWhiteSpace(container.IPAddress) && container.Ports.Count > 0)
+                {
+                    <Typography Secondary Small>Ports at its own address, @container.IPAddress</Typography>
+                    <Flex Gap="Gap.Small" Wrap>
+                        @foreach (var port in container.Ports)
+                        {
+                            <Button Small Text title="Use as the address and port players connect to" OnClick="() => UsePort(port)">
+                                <Typography Code>@container.IPAddress:@port.Key</Typography>
+                            </Button>
+                        }
+                    </Flex>
+                }
+                else if (container.Ports.Any(p => p.HostPort != null))
                 {
                     <Typography Secondary Small>Published ports</Typography>
                     <Flex Gap="Gap.Small" Wrap>
@@ -118,13 +150,16 @@
     string? _error;
     bool _loading;
 
+    // A new container's name and image, then its settings as read from the image
     ContainerDefinition? _creating;
+    ContainerDefinition? _draft;
     bool _creatingNow;
     string? _progress;
 
-    // Follows the image until the administrator chooses
-    bool _serverImage;
-    bool _serverImageChosen;
+    // Whether to install a new server's shared game files once it's created, and who else uses them
+    bool _installGameFiles;
+    IReadOnlyList<string> _gameFilesSharedWith = [];
+    IReadOnlyList<string> _gameFilesLog = [];
 
     /// <summary>The host's containers by name; and the server's own, by id, if it was chosen before the plugin.</summary>
     IEnumerable<SelectItem<string>> ContainerItems
@@ -156,6 +191,7 @@
 
         _container = null;
         _creating = null;
+        _draft = null;
 
         await LoadContainersAsync();
     }
@@ -249,58 +285,95 @@
             .ToArray()).Trim('-');
 
         _creating = new ContainerDefinition { Name = string.IsNullOrEmpty(name) ? "game-server" : name };
+        _draft = null;
         _progress = null;
-        _serverImage = false;
-        _serverImageChosen = false;
     }
 
-    void SetCreatingImage(string? image)
+    void CancelCreating()
     {
-        if (_creating == null)
-            return;
-
-        _creating.Image = image ?? "";
-
-        if (!_serverImageChosen)
-            _serverImage = IsServerImage(_creating.Image);
+        _creating = null;
+        _draft = null;
+        _progress = null;
     }
 
-    void SetServerImage(bool value)
+    IProgress<string> Progress() => new Progress<string>(message => InvokeAsync(() =>
     {
-        _serverImage = value;
-        _serverImageChosen = true;
-    }
+        _progress = message;
+        StateHasChanged();
+    }));
 
-    /// <summary>One of LANCommander's server images, which mount an overlay as root before starting the server as their own user.</summary>
-    internal static bool IsServerImage(string image) =>
-        image.Trim().StartsWith("lancommander/", StringComparison.OrdinalIgnoreCase)
-        || image.Trim().StartsWith("docker.io/lancommander/", StringComparison.OrdinalIgnoreCase);
-
-    async Task CreateAsync()
+    /// <summary>Pulls and reads the image, to fill in the new container's settings from it.</summary>
+    async Task ReadImageAsync()
     {
         if (_creating == null || Settings.HostId is not { } hostId)
             return;
 
         _creatingNow = true;
 
-        _creating.CanMountOverlay = _serverImage;
-        _creating.User = _serverImage ? "root" : "";
+        try
+        {
+            _draft = await Containers.DefineFromImageAsync(hostId, _creating.Name, _creating.Image, Progress());
+            _gameFilesSharedWith = [];
+            _installGameFiles = false;
+
+            if (_draft.GameFiles is { } gameFiles)
+            {
+                try
+                {
+                    _gameFilesSharedWith = (await Containers.ReadHostUsageAsync(hostId, []))
+                        .SharersOf(gameFiles)
+                        .Select(s => s.Container)
+                        .Distinct()
+                        .ToList();
+                }
+                catch (Exception)
+                {
+                    // Taken as unused; the administrator can still choose
+                }
+
+                _installGameFiles = _gameFilesSharedWith.Count == 0;
+            }
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, "The image could not be read");
+        }
+        finally
+        {
+            _creatingNow = false;
+            _progress = null;
+        }
+    }
+
+    async Task CreateAsync()
+    {
+        if (_draft is not { } draft || Settings.HostId is not { } hostId)
+            return;
+
+        _creatingNow = true;
 
         try
         {
-            var name = await Containers.CreateAsync(hostId, _creating, new Progress<string>(message => InvokeAsync(() =>
-            {
-                _progress = message;
-                StateHasChanged();
-            })));
+            var name = await Containers.CreateAsync(hostId, draft, Progress());
 
             Notifications.Success($"Created {name}");
 
+            // While the card is still up to show how it's going
+            if (_installGameFiles && draft.GameFiles != null)
+                await InstallGameFilesAsync(hostId, name);
+
             _creating = null;
-            _progress = null;
+            _draft = null;
 
             await LoadContainersAsync();
             await SetContainerAsync(name);
+
+            // A server image's files are browsed as the server sees them, with changes kept in its overlay
+            if (ContainerDefinition.IsServerImage(draft.Image) && Settings.FilesPath == null)
+                SetFilesPath("/config/Merged");
+
+            if (Context.Server.Port == 0 && FirstPlayerPort(draft) is { } address)
+                Context.SetAddress(address.Host, address.Port);
         }
         catch (Exception ex)
         {
@@ -309,8 +382,51 @@
         finally
         {
             _creatingNow = false;
+            _progress = null;
         }
     }
 
-    void UsePort(PortMapping port) => Context.SetAddress(null, port.HostPort);
+    /// <summary>Installs a new server's game files; the server is made either way, so a failure is only reported.</summary>
+    async Task InstallGameFilesAsync(Guid hostId, string container)
+    {
+        try
+        {
+            _gameFilesLog = (await Containers.UpdateGameFilesAsync(hostId, container, Progress())).Log;
+
+            Notifications.Success($"Game files install finished for {container}. Check its log for errors.");
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, $"{container} was created, but its game files could not be installed. Try Update Game Files on its Container page once it's saved");
+        }
+    }
+
+    /// <summary>
+    /// Where players most likely connect to a new container: its first UDP port, or first port, at its
+    /// own address if it has one. Null when that isn't known before it runs.
+    /// </summary>
+    static (string? Host, int Port)? FirstPlayerPort(ContainerDefinition spec)
+    {
+        var port = spec.Ports.FirstOrDefault(p => p.Protocol == "udp") ?? spec.Ports.FirstOrDefault();
+
+        if (port == null)
+            return null;
+
+        if (!string.IsNullOrWhiteSpace(spec.IPAddress))
+            return (spec.IPAddress.Trim(), port.ContainerPort);
+
+        if (spec.Network.Trim() == "host")
+            return (null, port.ContainerPort);
+
+        return port.HostPort is { } hostPort ? (null, hostPort) : null;
+    }
+
+    /// <summary>Makes the port where players connect to the server; at the container's own address if it has one.</summary>
+    void UsePort(PortMapping port)
+    {
+        if (_container is { IPAddress.Length: > 0 } container)
+            Context.SetAddress(container.IPAddress, port.ContainerPort);
+        else
+            Context.SetAddress(null, port.HostPort);
+    }
 }

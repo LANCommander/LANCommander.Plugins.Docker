@@ -1,0 +1,19 @@
+@* The end of a game files update's log: the images report a failed install there, not by failing *@
+
+@if (Lines.Count > 0)
+{
+    <Card Title="Game files update" Subtitle="The end of its log. The image reports an install that failed here, such as game files it couldn't find or download.">
+        <Extra>
+            <Button Text Small Icon="IconType.X" title="Close" OnClick="OnClose" />
+        </Extra>
+        <ChildContent>
+            <pre class="edit-form-mono" style="max-height: 20rem; overflow: auto; margin: 0; white-space: pre-wrap;">@string.Join("\n", Lines)</pre>
+        </ChildContent>
+    </Card>
+}
+
+@code {
+    [Parameter] public IReadOnlyList<string> Lines { get; set; } = [];
+
+    [Parameter] public EventCallback OnClose { get; set; }
+}

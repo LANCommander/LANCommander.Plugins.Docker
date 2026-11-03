@@ -30,6 +30,12 @@ public sealed class DockerHost
     /// </summary>
     public string Address { get; set; } = "";
 
+    /// <summary>
+    /// A folder on the Docker host new containers keep their data in, each in a folder of its name,
+    /// e.g. <c>/data/Servers</c>. Empty for named Docker volumes.
+    /// </summary>
+    public string DataFolder { get; set; } = "";
+
     /// <summary>The address of the local daemon on this operating system.</summary>
     public static string DefaultAddress => OperatingSystem.IsWindows()
         ? "npipe://./pipe/docker_engine"

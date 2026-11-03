@@ -149,6 +149,63 @@ public sealed class PageTests : BunitContext
         Assert.Contains("16", values);
     }
 
+    [DockerFact]
+    public async Task ANewContainerIsWarnedOfPortsAnotherPublishes()
+    {
+        _settings.Current.Hosts.Add(_local);
+
+        await Services.GetRequiredService<ContainerService>().CreateAsync(_local.Id, new ContainerDefinition
+        {
+            Name = _name,
+            Image = DockerEngineTests.Image,
+            Command = "sleep 600",
+            Ports = [new PortMapping { ContainerPort = 27960, HostPort = 47960 }],
+        });
+
+        var spec = new ContainerDefinition
+        {
+            Name = _name + "-second",
+            Image = DockerEngineTests.Image,
+            Ports = [new PortMapping { ContainerPort = 27960, HostPort = 47960 }],
+        };
+
+        var form = Render<ContainerForm>(parameters => parameters
+            .Add(p => p.Spec, spec)
+            .Add(p => p.HostId, _local.Id));
+
+        form.WaitForAssertion(() => Assert.Contains($"also taken by {_name} (stopped)", form.Markup));
+
+        await form.FindAll("button").Single(b => b.TextContent.Contains("Move host ports up by 1")).ClickAsync(new());
+
+        Assert.Equal(47961, spec.Ports.Single().HostPort);
+        form.WaitForAssertion(() => Assert.DoesNotContain("may collide", form.Markup));
+    }
+
+    [Fact]
+    public void TheFormShowsWhatTheImageGivesAndWhyCollisionsArentChecked()
+    {
+        var spec = new ContainerDefinition
+        {
+            Name = "deusex",
+            Image = "lancommander/deusex",
+            Network = "host",
+            Ports = [new PortMapping { ContainerPort = 7790, HostPort = 7790 }],
+            Mounts = [new VolumeMount { Source = "/data/Servers/deusex/Base", Destination = "/config/Server" }],
+            Defaults = new ImageDefaults { Environment = [new EnvironmentVariable { Name = "DX_PORT", Value = "7790" }] },
+        };
+
+        // A host that can't be reached
+        var form = Render<ContainerForm>(parameters => parameters
+            .Add(p => p.Spec, spec)
+            .Add(p => p.HostId, Guid.NewGuid()));
+
+        form.WaitForAssertion(() => Assert.Contains("collisions and shared folders aren't checked", form.Markup));
+
+        Assert.Contains("DX_PORT=7790", form.Markup);
+        Assert.Contains("host ports don't apply", form.Markup);
+        Assert.Contains("for every server of this game on the host to share", form.Markup);
+    }
+
     [Fact]
     public void TheContainerPageAsksForAContainerFirst()
     {

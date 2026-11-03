@@ -252,7 +252,234 @@ public sealed class ContainerDefinitionTests
     [InlineData("itzg/minecraft-server", false)]
     public void LANCommandersServerImagesAreRecognized(string image, bool expected)
     {
-        Assert.Equal(expected, LANCommander.Plugins.Docker.Components.DockerServerEditor.IsServerImage(image));
+        Assert.Equal(expected, ContainerDefinition.IsServerImage(image));
+    }
+
+    private static ImageInspectResponse Image(string[] ports, string[]? volumes = null, string[]? env = null) => new()
+    {
+        ID = "sha256:2222",
+        Config = new DockerOCIImageConfig
+        {
+            ExposedPorts = ports.ToDictionary(p => p, _ => default(EmptyStruct)),
+            Volumes = volumes?.ToDictionary(v => v, _ => default(EmptyStruct)),
+            Env = env,
+        },
+    };
+
+    [Fact]
+    public void AServerImageIsSetUpAsItsComposeExampleIs()
+    {
+        var spec = ContainerDefinition.ForImage("deusex-dm", "lancommander/deusex:latest", Image(["7790/udp", "7791/udp", "8777/udp"], env: ["DX_PORT=7790"]), "/data/Servers");
+
+        Assert.Equal(["7790:7790/udp", "7791:7791/udp", "8777:8777/udp"], spec.Ports.Select(p => p.ToString()));
+
+        // The server's own files, and the game's, shared with the game's other servers
+        Assert.Equal(["/data/Servers/deusex/deusex-dm:/config", "/data/Servers/deusex/Base:/config/Server"], spec.Mounts.Select(m => $"{m.Source}:{m.Destination}"));
+        Assert.True(spec.CanMountOverlay);
+        Assert.Equal("root", spec.User);
+        Assert.Equal("unless-stopped", spec.RestartPolicy);
+        Assert.Empty(spec.Environment);
+        Assert.Contains(spec.Defaults!.Environment, v => v.Name == "DX_PORT");
+
+        spec.Validate();
+    }
+
+    [Fact]
+    public void ServersOfTheSameGameShareItsFilesButNotTheirOwn()
+    {
+        // The WINE image declares VOLUME /config, which game images built on it inherit
+        var image = Image(["27960/udp"], ["/config"]);
+        var ctf = ContainerDefinition.ForImage("quake3-ctf", "lancommander/quake3:latest", image, "/data/Servers");
+        var deathmatch = ContainerDefinition.ForImage("quake3-dm", "docker.io/lancommander/quake3:1.36", image, "/data/Servers");
+
+        Assert.Equal(Base(ctf).Source, Base(deathmatch).Source);
+        Assert.NotEqual(Own(ctf).Source, Own(deathmatch).Source);
+        Assert.Equal(2, ctf.Mounts.Count);
+
+        static VolumeMount Base(ContainerDefinition spec) => spec.Mounts.Single(m => m.Destination == "/config/Server");
+        static VolumeMount Own(ContainerDefinition spec) => spec.Mounts.Single(m => m.Destination == "/config");
+    }
+
+    [Fact]
+    public void WithoutADataFolderAGamesFilesAreANamedVolume()
+    {
+        var spec = ContainerDefinition.ForImage("quake3-ctf", "lancommander/quake3", Image(["27960/udp"]), null);
+
+        Assert.Equal(["quake3-ctf-config:/config", "quake3-base:/config/Server"], spec.Mounts.Select(m => $"{m.Source}:{m.Destination}"));
+    }
+
+    [Theory]
+    [InlineData("lancommander/steamcmd:latest")]
+    [InlineData("lancommander/wine")]
+    [InlineData("lancommander/base")]
+    public void ServersOfTheImagesGamesAreBuiltOnDontShareTheirFiles(string image)
+    {
+        // They run whichever game they're told to, so two of them needn't have the same game
+        var spec = ContainerDefinition.ForImage("custom", image, Image([]), "/data/Servers");
+
+        Assert.Equal(["/data/Servers/custom:/config"], spec.Mounts.Select(m => $"{m.Source}:{m.Destination}"));
+        Assert.True(spec.CanMountOverlay);
+    }
+
+    [Theory]
+    [InlineData("lancommander/quake3", "quake3")]
+    [InlineData("lancommander/DeusEx:1.0", "deusex")]
+    [InlineData("registry:5000/lancommander/rtcw:latest", "rtcw")]
+    [InlineData("lancommander/ut2004@sha256:abc", "ut2004")]
+    public void AnImagesGameIsItsRepositorysName(string image, string game)
+    {
+        Assert.Equal(game, ContainerDefinition.GameOf(image));
+    }
+
+    [Fact]
+    public void AGameFilesUpdateRunsTheInstallStepAloneAndExits()
+    {
+        var server = ContainerDefinition.ForImage("quake3-ctf", "lancommander/quake3", Image(["27960/udp"]), "/data/Servers");
+
+        server.Network = "lan";
+        server.IPAddress = "192.168.1.50";
+        server.Environment = [new EnvironmentVariable { Name = "START_ARGS", Value = "+map q3ctf1" }, new EnvironmentVariable { Name = "Q3_HOSTNAME", Value = "CTF" }];
+
+        var update = server.ForUpdatingGameFiles("quake3-ctf-update");
+
+        Assert.Equal(server.GameFiles!.Source, update.GameFiles!.Source);
+        Assert.Equal(server.Mounts.Select(m => m.Source), update.Mounts.Select(m => m.Source));
+        Assert.True(update.CanMountOverlay);
+        Assert.Equal("root", update.User);
+
+        // Nothing that could collide with the running servers, nor start the game
+        Assert.Empty(update.Ports);
+        Assert.Equal("", update.Network);
+        Assert.Equal("", update.IPAddress);
+        Assert.Equal("no", update.RestartPolicy);
+
+        var env = update.Environment.ToDictionary(v => v.Name, v => v.Value);
+
+        Assert.Equal("true", env["START_EXE"]);
+        Assert.Equal("", env["START_ARGS"]);
+        Assert.Equal("true", env["STEAM_APP_UPDATE"]);
+        Assert.Equal("CTF", env["Q3_HOSTNAME"]);
+
+        // and the server's own definition is left as it was
+        Assert.Equal("+map q3ctf1", server.Environment.Single(v => v.Name == "START_ARGS").Value);
+
+        update.Validate();
+    }
+
+    [Fact]
+    public void ServersSharingGameFilesDontUpdateThemWhenTheyStart()
+    {
+        var spec = ContainerDefinition.ForImage("hl2dm-1", "lancommander/halflife2deathmatch", Image(["27015/udp"], env: ["STEAM_APP_UPDATE=true", "STEAM_APP_ID=232370"]), "/data/Servers");
+
+        Assert.Equal(["STEAM_APP_UPDATE=false"], spec.Environment.Select(v => $"{v.Name}={v.Value}"));
+
+        // while an update turns it back on
+        Assert.Contains(spec.ForUpdatingGameFiles("hl2dm-1-update").Environment, v => v.Name == "STEAM_APP_UPDATE" && v.Value == "true");
+    }
+
+    [Theory]
+    [InlineData("lancommander/quake3")]
+    [InlineData("lancommander/steamcmd")]
+    public void OnlyAnImageThatUpdatesItsSharedFilesIsToldNotTo(string image)
+    {
+        // Quake 3 has no such setting; the SteamCMD image's servers don't share their files
+        var spec = ContainerDefinition.ForImage("server", image, Image([], env: image.EndsWith("steamcmd") ? ["STEAM_APP_UPDATE=true"] : []), "/data/Servers");
+
+        Assert.Empty(spec.Environment);
+    }
+
+    [Fact]
+    public void OnlyAServerMountingGameFilesHasThem()
+    {
+        Assert.Null(ContainerDefinition.ForImage("custom", "lancommander/steamcmd", Image([]), "/data/Servers").GameFiles);
+    }
+
+    [Fact]
+    public void ContainersSharingAFolderAreFound()
+    {
+        var usage = new HostUsage([], [
+            new MountUse("quake3-ctf", true, "/data/Servers/quake3/Base", "/config/Server", false),
+            new MountUse("quake3-dm", false, "/data/Servers/quake3/Base/", "/config/Server", false),
+            new MountUse("rtcw", true, "/data/Servers/rtcw/Base", "/config/Server", false),
+        ]);
+
+        var sharers = usage.SharersOf(new VolumeMount { Source = "/data/Servers/quake3/Base", Destination = "/config/Server" });
+
+        Assert.Equal(["quake3-ctf", "quake3-dm"], sharers.Select(s => s.Container));
+        Assert.Empty(usage.SharersOf(new VolumeMount { Source = "", Destination = "/x" }));
+    }
+
+    [Fact]
+    public void AnotherImagesVolumesAreNamedVolumesWithoutADataFolder()
+    {
+        var spec = ContainerDefinition.ForImage("mc", "itzg/minecraft-server", Image(["25565/tcp"], ["/data", "/mods/"]), null);
+
+        Assert.Equal(["mc-data:/data", "mc-mods:/mods"], spec.Mounts.Select(m => $"{m.Source}:{m.Destination}"));
+        Assert.False(spec.CanMountOverlay);
+        Assert.Equal("", spec.User);
+        Assert.Equal("no", spec.RestartPolicy);
+    }
+
+    [Theory]
+    [InlineData("/data/Servers/", "/data/Servers/game/data")]
+    [InlineData(@"D:\Servers", @"D:\Servers\game\data")]
+    public void SeveralVolumesEachHaveAFolderUnderTheDataFolder(string dataFolder, string expected)
+    {
+        var spec = ContainerDefinition.ForImage("game", "example/game", Image([], ["/data", "/logs"]), dataFolder);
+
+        Assert.Equal(expected, spec.Mounts.Single(m => m.Destination == "/data").Source);
+    }
+
+    [Fact]
+    public void AFixedAddressOnItsNetworkIsKept()
+    {
+        var old = Inspected();
+
+        old.HostConfig.NetworkMode = "lan";
+        old.NetworkSettings = new NetworkSettings
+        {
+            Networks = new Dictionary<string, EndpointSettings>
+            {
+                ["lan"] = new() { IPAddress = "192.168.1.50", IPAMConfig = new EndpointIPAMConfig { IPv4Address = "192.168.1.50" } },
+            },
+        };
+
+        var spec = ContainerDefinition.From(old);
+
+        Assert.Equal("lan", spec.Network);
+        Assert.Equal("192.168.1.50", spec.IPAddress);
+
+        var parameters = spec.ToCreateParameters(old);
+
+        Assert.Equal("lan", parameters.HostConfig.NetworkMode);
+        Assert.Equal("192.168.1.50", parameters.NetworkingConfig.EndpointsConfig["lan"].IPAMConfig.IPv4Address);
+    }
+
+    [Fact]
+    public void AnAssignedAddressIsNotMadeFixed()
+    {
+        var old = Inspected();
+
+        old.HostConfig.NetworkMode = "lan";
+        old.NetworkSettings = new NetworkSettings { Networks = new Dictionary<string, EndpointSettings> { ["lan"] = new() { IPAddress = "192.168.1.77" } } };
+
+        var spec = ContainerDefinition.From(old);
+
+        Assert.Equal("", spec.IPAddress);
+        Assert.Null(spec.ToCreateParameters(old).NetworkingConfig);
+    }
+
+    [Theory]
+    [InlineData("", "10.0.0.5", "needs a network of the host's own")]
+    [InlineData("bridge", "10.0.0.5", "needs a network of the host's own")]
+    [InlineData("lan", "not-an-ip", "isn't an IPv4")]
+    public void AFixedAddressNeedsANetworkThatCanGiveIt(string network, string address, string message)
+    {
+        var spec = new ContainerDefinition { Name = "ok", Image = "busybox", Network = network, IPAddress = address };
+
+        var error = Assert.Throws<ArgumentException>(spec.Validate);
+
+        Assert.Contains(message, error.Message);
     }
 
     [Theory]

@@ -51,6 +51,15 @@ public sealed class ContainerDefinition
     public List<string> SecurityOptions { get; set; } = [];
 
     /// <summary>
+    /// The network the container joins: <c>bridge</c>, <c>host</c>, or one of the host's own, such as a
+    /// macvlan network giving it an address on the LAN. Empty for Docker's default bridge.
+    /// </summary>
+    public string Network { get; set; } = "";
+
+    /// <summary>A fixed IPv4 address on <see cref="Network"/>; empty for one the network assigns.</summary>
+    public string IPAddress { get; set; } = "";
+
+    /// <summary>
     /// What the image provides where the definition doesn't say, for showing alongside it; null when
     /// the container was read without its image. Not applied: Docker applies the image's itself.
     /// </summary>
@@ -149,6 +158,10 @@ public sealed class ContainerDefinition
             User = defaults != null && (config.User ?? "") == (defaults.User ?? "") ? "" : config.User ?? "",
             Capabilities = (host.CapAdd ?? []).ToList(),
             SecurityOptions = (host.SecurityOpt ?? []).ToList(),
+            Network = host.NetworkMode is null or "default" ? "" : host.NetworkMode,
+            IPAddress = host.NetworkMode != null && container.NetworkSettings?.Networks?.TryGetValue(host.NetworkMode, out var endpoint) == true
+                ? endpoint.IPAMConfig?.IPv4Address ?? ""
+                : "",
             Defaults = defaults == null ? null : new ImageDefaults
             {
                 Environment = (defaults.Env ?? []).Select(EnvironmentVariable.Parse).ToList(),
@@ -233,9 +246,206 @@ public sealed class ContainerDefinition
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
+        host.NetworkMode = string.IsNullOrWhiteSpace(Network) ? null : Network.Trim();
+
+        // Docker doesn't keep a fixed address unless it's asked for again
+        parameters.NetworkingConfig = string.IsNullOrWhiteSpace(IPAddress)
+            ? null
+            : new NetworkingConfig
+            {
+                EndpointsConfig = new Dictionary<string, EndpointSettings>
+                {
+                    [Network.Trim()] = new EndpointSettings { IPAMConfig = new EndpointIPAMConfig { IPv4Address = IPAddress.Trim() } },
+                },
+            };
+
         parameters.HostConfig = host;
 
         return parameters;
+    }
+
+    /// <summary>Where LANCommander's server images keep a server's own files: its overlay, scripts and so on.</summary>
+    public const string ConfigFolder = "/config";
+
+    /// <summary>
+    /// Where LANCommander's server images keep the game's files: the overlay's lower layer, which the
+    /// server only changes through its overlay, so servers of the same game can share it.
+    /// </summary>
+    public const string BaseFolder = "/config/Server";
+
+    /// <summary>The folder a game's shared files are kept in, beside its servers' own.</summary>
+    public const string BaseFolderName = "Base";
+
+    /// <summary>
+    /// A definition for a new container from an image, as far as the image tells: its ports published
+    /// on the same host ports, its volumes kept under <paramref name="dataFolder"/>, and for one of
+    /// LANCommander's server images, its <c>/config</c> folder and the privileges it needs.
+    /// </summary>
+    /// <remarks>
+    /// A game's server image gets the game's files from a folder shared by every server of the game,
+    /// mounted as <see cref="BaseFolder"/>: the image lays an overlay of the server's own over them,
+    /// so a deathmatch and a CTF server keep one copy of the game, each with its own configuration.
+    /// </remarks>
+    /// <param name="dataFolder">
+    /// A folder on the Docker host to keep the container's volumes in: a game's in a folder of the
+    /// game's name, holding its shared files and a folder for each server; another image's in a folder
+    /// of the container's name. Without one, they're named Docker volumes.
+    /// </param>
+    public static ContainerDefinition ForImage(string name, string image, ImageInspectResponse inspected, string? dataFolder)
+    {
+        var config = inspected.Config ?? new DockerOCIImageConfig();
+        var serverImage = IsServerImage(image);
+        var game = SharesGameFiles(image) ? GameOf(image) : null;
+
+        var volumes = (config.Volumes?.Keys ?? [])
+            .Concat(serverImage ? [ConfigFolder] : [])
+            .Select(path => path.TrimEnd('/'))
+            .Where(path => path.Length > 0)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        var mounts = volumes
+            .Select(path => new VolumeMount { Source = VolumeSource(name, game, path, volumes.Count, dataFolder), Destination = path })
+            .ToList();
+
+        if (game != null && !volumes.Contains(BaseFolder))
+            mounts.Add(new VolumeMount { Source = BaseSource(game, dataFolder), Destination = BaseFolder });
+
+        // Shared game files mustn't change under another server's overlay, so a server doesn't update
+        // them when it starts; Update Game Files does, with them all stopped
+        List<EnvironmentVariable> environment = game != null && (config.Env ?? []).Any(v => v.StartsWith(UpdateVariable + "=", StringComparison.Ordinal))
+            ? [new EnvironmentVariable { Name = UpdateVariable, Value = "false" }]
+            : [];
+
+        var spec = new ContainerDefinition
+        {
+            Name = name,
+            Image = image,
+            Ports = (config.ExposedPorts?.Keys ?? [])
+                .Select(key => PortMapping.Parse(key, null))
+                .Where(port => port.ContainerPort > 0)
+                .Select(port =>
+                {
+                    port.HostPort = port.ContainerPort;
+                    return port;
+                })
+                .OrderBy(p => p.ContainerPort)
+                .ThenBy(p => p.Protocol)
+                .ToList(),
+            Mounts = mounts,
+            Environment = environment,
+            RestartPolicy = serverImage ? "unless-stopped" : "no",
+            User = serverImage ? "root" : "",
+            Defaults = new ImageDefaults
+            {
+                Environment = (config.Env ?? []).Select(EnvironmentVariable.Parse).ToList(),
+                Command = ShellWords.Join(config.Cmd),
+                User = config.User ?? "",
+            },
+        };
+
+        spec.CanMountOverlay = serverImage;
+
+        return spec;
+    }
+
+    /// <summary>The game files folder the container mounts as <see cref="BaseFolder"/>, if it does.</summary>
+    public VolumeMount? GameFiles => Mounts.FirstOrDefault(m => m.Destination.Trim().TrimEnd('/') == BaseFolder && !string.IsNullOrWhiteSpace(m.Source));
+
+    /// <summary>Whether a SteamCMD image installs and updates its game when it starts.</summary>
+    public const string UpdateVariable = "STEAM_APP_UPDATE";
+
+    // Set on a one-off container so the image installs or updates the game, then exits rather than
+    // starting the server: START_EXE runs after the image's install hooks, and `true` exits at once
+    private static readonly Dictionary<string, string> UpdateOnly = new()
+    {
+        ["START_EXE"] = "true",
+        ["START_ARGS"] = "",
+        [UpdateVariable] = "true",
+        ["HTTP_FILESERVER_ENABLED"] = "false",
+    };
+
+    /// <summary>
+    /// A one-off container like this server's that runs the image's install and update step on its
+    /// files, then exits without starting the server. It publishes no ports and joins Docker's default
+    /// network, so it can run beside anything and still reach the internet.
+    /// </summary>
+    public ContainerDefinition ForUpdatingGameFiles(string name) => new()
+    {
+        Name = name,
+        Image = Image,
+        Command = Command,
+        Environment = Environment
+            .Where(v => !UpdateOnly.ContainsKey(v.Name.Trim()))
+            .Select(v => new EnvironmentVariable { Name = v.Name, Value = v.Value })
+            .Concat(UpdateOnly.Select(v => new EnvironmentVariable { Name = v.Key, Value = v.Value }))
+            .ToList(),
+        Mounts = Mounts.Select(m => new VolumeMount { Source = m.Source, Destination = m.Destination, ReadOnly = m.ReadOnly }).ToList(),
+        RestartPolicy = "no",
+        Interactive = false,
+        Terminal = false,
+        User = User,
+        Capabilities = [.. Capabilities],
+        SecurityOptions = [.. SecurityOptions],
+        Defaults = Defaults,
+    };
+
+    /// <summary>
+    /// Where a new container's volume is kept: a folder under the data folder, in the game's folder for
+    /// a game's server, or a named volume.
+    /// </summary>
+    private static string VolumeSource(string name, string? game, string destination, int volumes, string? dataFolder)
+    {
+        var leaf = SafeName(destination);
+
+        if (string.IsNullOrWhiteSpace(dataFolder))
+            return $"{name}-{leaf}";
+
+        var separator = SeparatorOf(dataFolder);
+        var root = dataFolder.Trim().TrimEnd('/', '\\');
+        var folder = game == null ? root + separator + name : root + separator + game + separator + name;
+
+        return volumes == 1 ? folder : folder + separator + leaf;
+    }
+
+    /// <summary>Where a game's files are kept for every server of it to share.</summary>
+    private static string BaseSource(string game, string? dataFolder) =>
+        string.IsNullOrWhiteSpace(dataFolder)
+            ? $"{game}-{BaseFolderName.ToLowerInvariant()}"
+            : dataFolder.Trim().TrimEnd('/', '\\') + SeparatorOf(dataFolder) + game + SeparatorOf(dataFolder) + BaseFolderName;
+
+    // The Docker host's own separator; a Windows path has backslashes
+    private static char SeparatorOf(string folder) => folder.Contains('\\') ? '\\' : '/';
+
+    private static string SafeName(string path)
+    {
+        var name = new string(path.Trim('/').Select(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or '-' ? c : '-').ToArray()).Trim('-');
+
+        return name.Length == 0 ? "data" : name;
+    }
+
+    /// <summary>One of LANCommander's server images, which mount an overlay as root before starting the server as their own user.</summary>
+    public static bool IsServerImage(string image) =>
+        image.Trim().StartsWith("lancommander/", StringComparison.OrdinalIgnoreCase)
+        || image.Trim().StartsWith("docker.io/lancommander/", StringComparison.OrdinalIgnoreCase);
+
+    // The images games are built on, which run whichever game they're told to, so their servers
+    // don't have the same game's files to share
+    private static readonly HashSet<string> GenericImages = new(StringComparer.OrdinalIgnoreCase) { "base", "steamcmd", "wine" };
+
+    /// <summary>
+    /// Whether the image is a LANCommander image of one game, whose servers share the game's files: not
+    /// one of the images games are built on.
+    /// </summary>
+    public static bool SharesGameFiles(string image) => IsServerImage(image) && !GenericImages.Contains(GameOf(image));
+
+    /// <summary>The game an image is for, as its repository's name: <c>lancommander/quake3:1.0</c> is <c>quake3</c>.</summary>
+    public static string GameOf(string image)
+    {
+        var (repository, _) = ContainerService.SplitImage(image.Trim());
+
+        return SafeName(repository.Split('@')[0].Split('/')[^1].ToLowerInvariant());
     }
 
     /// <summary>Clears what the old container had only from its image, so the new one's image decides.</summary>
@@ -295,6 +505,15 @@ public sealed class ContainerDefinition
         {
             if (port.ContainerPort is < 1 or > 65535 || port.HostPort is < 1 or > 65535)
                 throw new ArgumentException($"{port} isn't a port from 1 to 65535.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(IPAddress))
+        {
+            if (!System.Net.IPAddress.TryParse(IPAddress.Trim(), out var address) || address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                throw new ArgumentException($"\"{IPAddress}\" isn't an IPv4 address.");
+
+            if (Network.Trim() is "" or "bridge" or "host" or "none" or "default")
+                throw new ArgumentException("A fixed address needs a network of the host's own, such as a macvlan network; Docker's bridge and host networks can't give one.");
         }
 
         foreach (var variable in Environment.Where(v => !string.IsNullOrWhiteSpace(v.Name)))

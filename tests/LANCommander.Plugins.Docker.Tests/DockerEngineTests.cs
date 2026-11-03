@@ -349,6 +349,59 @@ public sealed class DockerEngineTests : IAsyncLifetime
     }
 
     [DockerFact]
+    public async Task GameFilesAreUpdatedWithEveryServerSharingThemStopped()
+    {
+        var client = _hosts.GetClient(_host.Id);
+        var gameFiles = _name + "-base";
+
+        // Two servers sharing game files; busybox has no install step, so the one-off container is
+        // told what to do with its command, which writes a file to show it ran with the files mounted
+        foreach (var server in new[] { "-ctf", "-dm" })
+        {
+            await _containers.CreateAsync(_host.Id, new ContainerDefinition
+            {
+                Name = _name + server,
+                Image = Image,
+                Command = "sh -c '[ \"$START_EXE\" = true ] && date > /config/Server/updated || sleep 600'",
+                Mounts = [new VolumeMount { Source = gameFiles, Destination = "/config/Server" }],
+            });
+        }
+
+        await client.Containers.StartContainerAsync(_name + "-ctf", new ContainerStartParameters());
+
+        var messages = new List<string>();
+        var update = await _containers.UpdateGameFilesAsync(_host.Id, _name + "-dm", new SynchronousProgress(messages));
+
+        Assert.Equal([_name + "-ctf", _name + "-dm"], update.Sharing);
+        Assert.Equal([_name + "-ctf"], update.Restarted);
+        Assert.Contains(messages, m => m.StartsWith("Stopping", StringComparison.Ordinal));
+
+        // The one that was running is again, and the update reached the shared files
+        Assert.True((await client.Containers.InspectContainerAsync(_name + "-ctf")).State.Running);
+        Assert.False((await client.Containers.InspectContainerAsync(_name + "-dm")).State.Running);
+
+        var exec = await client.Exec.CreateContainerExecAsync(_name + "-ctf", new ContainerExecCreateParameters { Cmd = ["cat", "/config/Server/updated"], AttachStdout = true }, CancellationToken.None);
+
+        using (var stream = await client.Exec.StartContainerExecAsync(exec.ID, new ContainerExecStartParameters(), CancellationToken.None))
+        {
+            var (stdout, _) = await stream.ReadOutputToEndAsync(CancellationToken.None);
+
+            Assert.False(string.IsNullOrWhiteSpace(stdout));
+        }
+
+        // and the one-off container is gone
+        var all = await client.Containers.ListContainersAsync(new ContainersListParameters { All = true });
+
+        Assert.DoesNotContain(all, c => c.Names.Any(n => n.Contains("-update-", StringComparison.Ordinal)));
+
+        // A named volume outlives its containers
+        foreach (var server in new[] { "-ctf", "-dm" })
+            await client.Containers.RemoveContainerAsync(_name + server, new ContainerRemoveParameters { Force = true });
+
+        await client.Volumes.RemoveAsync(gameFiles, force: true);
+    }
+
+    [DockerFact]
     public async Task AContainerThatCannotBeReplacedIsPutBack()
     {
         var server = await AddServerAsync("sleep 600");
