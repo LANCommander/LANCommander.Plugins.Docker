@@ -1,3 +1,5 @@
+using System.IO.Compression;
+using System.IO.Pipelines;
 using System.Net;
 using Docker.DotNet;
 using Docker.DotNet.Models;
@@ -20,6 +22,13 @@ public sealed record NetworkSummary(string Name, string Driver);
 /// failing, so it's the only word of one.
 /// </param>
 public sealed record GameFilesUpdate(IReadOnlyList<string> Sharing, IReadOnlyList<string> Restarted, IReadOnlyList<string> Log);
+
+/// <summary>What uploading a ZIP of game files did.</summary>
+/// <param name="Sharing">The containers that share the files, the one uploaded to among them.</param>
+/// <param name="Restarted">Those that were running, stopped for the upload and started again.</param>
+/// <param name="Files">How many files were copied.</param>
+/// <param name="StrippedFolder">The folder the ZIP had everything in, whose contents were copied rather than it; null if none.</param>
+public sealed record GameFilesUpload(IReadOnlyList<string> Sharing, IReadOnlyList<string> Restarted, int Files, string? StrippedFolder);
 
 /// <summary>What updating a container's image did.</summary>
 /// <param name="Replaced">Whether a newer image was pulled and the container replaced to use it.</param>
@@ -180,21 +189,10 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
         var gameFiles = spec.GameFiles
             ?? throw new DockerHostException($"{name} has no game files of its own to update: nothing is mounted at {ContainerDefinition.BaseFolder}.");
 
-        // Networks only matter to ports, which aren't looked at here
-        var sharers = (await ReadHostUsageAsync(hostId, [], cancellationToken: cancellationToken)).SharersOf(gameFiles);
-        var sharing = sharers.Select(s => s.Container).Distinct().Order(StringComparer.CurrentCultureIgnoreCase).ToList();
-        var running = sharers.Where(s => s.Running).Select(s => s.Container).Distinct().ToList();
         var log = new Queue<string>();
 
-        try
+        var (sharing, running) = await WithFilesFreeAsync(client, hostId, gameFiles, progress, async () =>
         {
-            if (running.Count > 0)
-            {
-                progress?.Report($"Stopping {string.Join(", ", running)}");
-
-                await Task.WhenAll(running.Select(c => client.Containers.StopContainerAsync(c, new ContainerStopParameters(), cancellationToken)));
-            }
-
             var parameters = spec.ForUpdatingGameFiles($"{name}-update-{DateTime.UtcNow:yyyyMMddHHmmss}").ToCreateParameters(server);
 
             // The image the server runs, even if its tag has moved on since; and none of its labels, so
@@ -233,8 +231,148 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
             {
                 await client.Containers.RemoveContainerAsync(created.ID, new ContainerRemoveParameters { Force = true }, CancellationToken.None);
             }
+        }, cancellationToken);
 
-            logger.LogInformation("Updated the game files {GameFiles} shared by {Containers}", gameFiles.Source, string.Join(", ", sharing));
+        logger.LogInformation("Updated the game files {GameFiles} shared by {Containers}", gameFiles.Source, string.Join(", ", sharing));
+
+        return new GameFilesUpdate(sharing, running, log.ToList());
+    }
+
+    /// <summary>
+    /// Puts the game files in a ZIP into a server's game files folder, while none of the servers sharing
+    /// it is running, as <see cref="UpdateGameFilesAsync"/> updates them: they're stopped, the files
+    /// are copied in through Docker's archive API, into a one-off container of the server's that's never
+    /// started, and those that were running are started again. Files already there are replaced; others
+    /// are left.
+    /// </summary>
+    /// <param name="zipPath">The ZIP, on this server's disk: reading one needs to seek, which an upload can't.</param>
+    /// <param name="stripTopFolder">Whether a ZIP whose files are all in one folder has that folder's contents put there, rather than the folder.</param>
+    /// <exception cref="DockerHostException">The server isn't one of LANCommander's server images.</exception>
+    /// <exception cref="InvalidDataException">The file isn't a ZIP.</exception>
+    public async Task<GameFilesUpload> UploadGameFilesAsync(Guid hostId, string container, string zipPath, bool stripTopFolder, IProgress<string>? progress = null, CancellationToken cancellationToken = default)
+    {
+        var client = hosts.GetClient(hostId);
+        var server = await client.Containers.InspectContainerAsync(container, cancellationToken);
+        var spec = ContainerDefinition.From(server);
+        var name = server.Name.TrimStart('/');
+
+        // Into the game files folder if it's mounted on its own; otherwise into the Server folder in the
+        // server's own files, where the images keep the game when it isn't shared
+        var (target, into, mount) = spec.GameFiles is { } gameFiles
+            ? (ContainerDefinition.BaseFolder, (string?)null, gameFiles)
+            : spec.Mounts.FirstOrDefault(m => m.Destination.Trim().TrimEnd('/') == ContainerDefinition.ConfigFolder) is { } config && ContainerDefinition.IsServerImage(spec.Image)
+                ? (ContainerDefinition.ConfigFolder, "Server", config)
+                : throw new DockerHostException($"{name} has no folder for game files: nothing is mounted at {ContainerDefinition.BaseFolder} or {ContainerDefinition.ConfigFolder}.");
+
+        using var zip = ZipFile.OpenRead(zipPath);
+        var strip = stripTopFolder ? GameFilesArchive.SingleTopFolder(zip) : null;
+        var files = 0;
+
+        var (sharing, running) = await WithFilesFreeAsync(client, hostId, mount, progress, async () =>
+        {
+            // Never started, so nothing in it runs: it's only a way to the server's folders
+            var created = await client.Containers.CreateContainerAsync(new CreateContainerParameters
+            {
+                Name = $"{name}-upload-{DateTime.UtcNow:yyyyMMddHHmmss}",
+                Image = server.Image,
+                HostConfig = new HostConfig
+                {
+                    Binds = spec.Mounts
+                        .Where(m => !string.IsNullOrWhiteSpace(m.Source) && !string.IsNullOrWhiteSpace(m.Destination))
+                        .Select(m => $"{m.Source.Trim()}:{m.Destination.Trim()}")
+                        .ToList(),
+                },
+            }, cancellationToken);
+
+            try
+            {
+                progress?.Report($"Copying the game files into {mount.Source}");
+
+                // The tar is made as Docker reads it, rather than kept whole
+                var pipe = new Pipe();
+                var copied = 0;
+
+                var writing = Task.Run(() =>
+                {
+                    try
+                    {
+                        using var output = pipe.Writer.AsStream();
+
+                        files = GameFilesArchive.WriteTar(zip, output, strip, new SynchronousProgress<string>(file =>
+                        {
+                            if (++copied % 100 == 1)
+                                progress?.Report($"Copying {copied} files: {file}");
+                        }), into);
+                    }
+                    catch (Exception ex)
+                    {
+                        pipe.Writer.Complete(ex);
+
+                        throw;
+                    }
+                }, cancellationToken);
+
+                Exception? refused = null;
+
+                try
+                {
+                    await client.Containers.ExtractArchiveToContainerAsync(created.ID, new CopyToContainerParameters { Path = target }, pipe.Reader.AsStream(), cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    refused = ex;
+                }
+                finally
+                {
+                    // So a tar Docker stopped reading doesn't wait to be read
+                    await pipe.Reader.CompleteAsync();
+                }
+
+                // Done with the ZIP before it's closed; Docker's refusal says more than the tar's end
+                try
+                {
+                    await writing;
+                }
+                catch (Exception) when (refused != null)
+                {
+                }
+
+                if (refused != null)
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(refused);
+            }
+            finally
+            {
+                await client.Containers.RemoveContainerAsync(created.ID, new ContainerRemoveParameters { Force = true }, CancellationToken.None);
+            }
+        }, cancellationToken);
+
+        logger.LogInformation("Copied {Files} game files from a ZIP into {GameFiles}, shared by {Containers}", files, mount.Source, string.Join(", ", sharing));
+
+        return new GameFilesUpload(sharing, running, files, strip);
+    }
+
+    /// <summary>
+    /// Does <paramref name="work"/> on a folder of game files with none of the containers mounting it
+    /// running: OverlayFS doesn't allow the files under a mounted overlay to change. Those that were
+    /// running are started again, whether or not it succeeded.
+    /// </summary>
+    private async Task<(IReadOnlyList<string> Sharing, IReadOnlyList<string> Restarted)> WithFilesFreeAsync(DockerClient client, Guid hostId, VolumeMount files, IProgress<string>? progress, Func<Task> work, CancellationToken cancellationToken)
+    {
+        // Networks only matter to ports, which aren't looked at here
+        var sharers = (await ReadHostUsageAsync(hostId, [], cancellationToken: cancellationToken)).SharersOf(files);
+        var sharing = sharers.Select(s => s.Container).Distinct().Order(StringComparer.CurrentCultureIgnoreCase).ToList();
+        var running = sharers.Where(s => s.Running).Select(s => s.Container).Distinct().ToList();
+
+        try
+        {
+            if (running.Count > 0)
+            {
+                progress?.Report($"Stopping {string.Join(", ", running)}");
+
+                await Task.WhenAll(running.Select(c => client.Containers.StopContainerAsync(c, new ContainerStopParameters(), cancellationToken)));
+            }
+
+            await work();
         }
         finally
         {
@@ -248,12 +386,12 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "Could not start {Container} again after updating its game files", stopped);
+                    logger.LogError(ex, "Could not start {Container} again after changing its game files", stopped);
                 }
             }
         }
 
-        return new GameFilesUpdate(sharing, running, log.ToList());
+        return (sharing, running);
     }
 
     // How much of a game files update's log is kept to show

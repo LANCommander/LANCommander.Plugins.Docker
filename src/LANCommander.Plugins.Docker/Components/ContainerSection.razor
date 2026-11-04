@@ -28,6 +28,27 @@ else if (_spec is { } spec && Settings.HostId is { } hostId)
 
         <GameFilesLog Lines="_gameFilesLog" OnClose="() => _gameFilesLog = []" />
 
+        @if (_uploadOpen && TakesGameFiles(spec))
+        {
+            <Card Title="Upload game files" Subtitle="@($"A ZIP of the game's files, put in {(spec.GameFiles?.Source ?? "the server's Server folder")}")">
+                <Flex Vertical Gap="Gap.Small">
+                    <Typography Secondary Small>
+                        Files of the same name are replaced, and others are kept. @(spec.GameFiles != null ? "Every server sharing these game files is stopped while they're copied, and started again if it was running." : "The server is stopped while they're copied, and started again if it was running.")
+                        The ZIP is kept on the LANCommander server only while it's copied.
+                    </Typography>
+
+                    <InputFile accept=".zip,application/zip" OnChange="ChooseZip" disabled="@Busy" />
+
+                    <Checkbox @bind-Value="_stripTopFolder">If everything in the ZIP is in one folder, copy what's in it rather than the folder, as a game zipped with its folder needs</Checkbox>
+
+                    <Flex Gap="Gap.Small">
+                        <Button Primary Icon="IconType.UploadSimple" Loading="_uploading" Disabled="_zip == null || (Busy && !_uploading)" OnClick="UploadGameFilesAsync">Upload</Button>
+                        <Button Text Disabled="_uploading" OnClick="() => { _uploadOpen = false; _zip = null; }">Cancel</Button>
+                    </Flex>
+                </Flex>
+            </Card>
+        }
+
         <FormItem>
             <Flex Gap="Gap.Small">
                 <Popconfirm OnConfirm="ApplyAsync" Title="Replace the container?" Description="It is stopped while it's replaced, and started again if it was running." OkText="Replace">
@@ -41,6 +62,10 @@ else if (_spec is { } spec && Settings.HostId is { } hostId)
                     <Popconfirm OnConfirm="UpdateGameFilesAsync" Title="Update the game files?" Description="@($"Every server sharing {spec.GameFiles.Source} is stopped while the image installs or updates the game there, then started again if it was running.")" OkText="Update">
                         <Button Icon="IconType.DownloadSimple" Loading="_updatingFiles" Disabled="Busy && !_updatingFiles">Update Game Files</Button>
                     </Popconfirm>
+                }
+                @if (TakesGameFiles(spec))
+                {
+                    <Button Icon="IconType.UploadSimple" Disabled="Busy" OnClick="() => _uploadOpen = !_uploadOpen">Upload Game Files</Button>
                 }
                 <Button Disabled="Busy" OnClick="LoadAsync">Discard</Button>
             </Flex>
@@ -66,7 +91,88 @@ else if (_spec is { } spec && Settings.HostId is { } hostId)
     string? _error;
     string? _progress;
 
-    bool Busy => _applying || _updating || _updatingFiles;
+    bool _uploadOpen;
+    bool _uploading;
+    bool _stripTopFolder = true;
+    IBrowserFile? _zip;
+
+    bool Busy => _applying || _updating || _updatingFiles || _uploading;
+
+    /// <summary>Whether game files can be put in the server: it has a folder of them, or keeps them in its own files.</summary>
+    static bool TakesGameFiles(ContainerDefinition spec) =>
+        spec.GameFiles != null
+        || (ContainerDefinition.IsServerImage(spec.Image) && spec.Mounts.Any(m => m.Destination.Trim().TrimEnd('/') == ContainerDefinition.ConfigFolder));
+
+    void ChooseZip(InputFileChangeEventArgs e) => _zip = e.File;
+
+    async Task UploadGameFilesAsync()
+    {
+        if (_zip is not { } zip || Settings.HostId is not { } hostId || Busy)
+            return;
+
+        _uploading = true;
+        _gameFilesLog = [];
+
+        var folder = Path.Combine(Path.GetTempPath(), "lancommander-docker");
+        var path = Path.Combine(folder, $"{Guid.NewGuid():N}.zip");
+
+        try
+        {
+            Directory.CreateDirectory(folder);
+
+            // A ZIP is read from its end, which an upload can't seek to, so it's kept on disk first
+            await using (var source = zip.OpenReadStream(maxAllowedSize: long.MaxValue))
+            await using (var target = File.Create(path))
+            {
+                var buffer = new byte[256 * 1024];
+                long copied = 0;
+                var reported = DateTime.MinValue;
+                int read;
+
+                while ((read = await source.ReadAsync(buffer)) > 0)
+                {
+                    await target.WriteAsync(buffer.AsMemory(0, read));
+                    copied += read;
+
+                    if (DateTime.UtcNow - reported > TimeSpan.FromMilliseconds(250))
+                    {
+                        reported = DateTime.UtcNow;
+                        _progress = $"Uploading {zip.Name}: {copied * 100 / Math.Max(zip.Size, 1)}% ({copied / (1024 * 1024)} of {zip.Size / (1024 * 1024)} MB)";
+                        StateHasChanged();
+                    }
+                }
+            }
+
+            var upload = await Containers.UploadGameFilesAsync(hostId, Settings.ContainerId, path, _stripTopFolder, Progress());
+
+            Notifications.Success($"{upload.Files} game files copied{(upload.StrippedFolder != null ? $" from {upload.StrippedFolder}/" : "")}{(upload.Restarted.Count > 0 ? $"; {string.Join(", ", upload.Restarted)} started again" : "")}");
+
+            _uploadOpen = false;
+            _zip = null;
+        }
+        catch (InvalidDataException)
+        {
+            Notifications.Error($"{zip.Name} isn't a ZIP file.");
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, "The game files could not be uploaded");
+        }
+        finally
+        {
+            _uploading = false;
+            _progress = null;
+
+            try
+            {
+                File.Delete(path);
+            }
+            catch (IOException)
+            {
+                // Left for the system to clear with its other temporary files
+            }
+        }
+    }
 
     protected override async Task OnParametersSetAsync()
     {

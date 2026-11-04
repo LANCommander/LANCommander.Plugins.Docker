@@ -462,6 +462,64 @@ public sealed class DockerEngineTests : IAsyncLifetime
     }
 
     [DockerFact]
+    public async Task AZipOfGameFilesIsCopiedInWithTheServersSharingThemStopped()
+    {
+        var client = _hosts.GetClient(_host.Id);
+        var gameFiles = _name + "-base";
+
+        foreach (var server in new[] { "-ctf", "-dm" })
+        {
+            await _containers.CreateAsync(_host.Id, new ContainerDefinition
+            {
+                Name = _name + server,
+                Image = Image,
+                Command = "sleep 600",
+                Mounts = [new VolumeMount { Source = gameFiles, Destination = "/config/Server" }],
+            });
+        }
+
+        await client.Containers.StartContainerAsync(_name + "-ctf", new ContainerStartParameters());
+
+        // A game zipped with its folder, as it usually is
+        using var scratch = new ScratchDirectory();
+        Directory.CreateDirectory(scratch.Path);
+        var zipPath = Path.Combine(scratch.Path, "deusex.zip");
+
+        using (var zip = System.IO.Compression.ZipFile.Open(zipPath, System.IO.Compression.ZipArchiveMode.Create))
+        {
+            using var writer = new StreamWriter(zip.CreateEntry("DeusEx/System/DeusEx.exe").Open());
+            writer.Write("MZ game");
+        }
+
+        var upload = await _containers.UploadGameFilesAsync(_host.Id, _name + "-dm", zipPath, stripTopFolder: true);
+
+        Assert.Equal(1, upload.Files);
+        Assert.Equal("DeusEx", upload.StrippedFolder);
+        Assert.Equal([_name + "-ctf"], upload.Restarted);
+
+        // The one that was running is again, and sees the game where the images look for it
+        Assert.True((await client.Containers.InspectContainerAsync(_name + "-ctf")).State.Running);
+
+        var exec = await client.Exec.CreateContainerExecAsync(_name + "-ctf", new ContainerExecCreateParameters { Cmd = ["cat", "/config/Server/System/DeusEx.exe"], AttachStdout = true }, CancellationToken.None);
+
+        using (var stream = await client.Exec.StartContainerExecAsync(exec.ID, new ContainerExecStartParameters(), CancellationToken.None))
+        {
+            var (stdout, _) = await stream.ReadOutputToEndAsync(CancellationToken.None);
+
+            Assert.Equal("MZ game", stdout);
+        }
+
+        var all = await client.Containers.ListContainersAsync(new ContainersListParameters { All = true });
+
+        Assert.DoesNotContain(all, c => c.Names.Any(n => n.Contains("-upload-", StringComparison.Ordinal)));
+
+        foreach (var server in new[] { "-ctf", "-dm" })
+            await client.Containers.RemoveContainerAsync(_name + server, new ContainerRemoveParameters { Force = true });
+
+        await client.Volumes.RemoveAsync(gameFiles, force: true);
+    }
+
+    [DockerFact]
     public async Task AContainerThatCannotBeReplacedIsPutBack()
     {
         var server = await AddServerAsync("sleep 600");
