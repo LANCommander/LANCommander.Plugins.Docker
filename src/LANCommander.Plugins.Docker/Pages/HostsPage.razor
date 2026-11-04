@@ -1,6 +1,7 @@
 @page "/Plugins/Docker/Hosts"
 @inject DockerHosts Hosts
 @inject NotificationService Notifications
+@inject LANCommander.SDK.Plugins.IPluginSettings<DockerSettings> Settings
 
 <PageHeader Title="Docker Hosts" Subtitle="The Docker daemons game servers can run on">
     <Extra>
@@ -71,6 +72,21 @@
                 </ActionsColumn>
             </Columns>
         </Table>
+
+        <Card Title="Image catalog" Subtitle="Where new servers' images are chosen from">
+            <Flex Vertical Gap="Gap.Small">
+                <Typography Secondary Small>
+                    LANCommander's server images are listed from Docker Hub, titled by their labels: org.opencontainers.image.title and .description, com.lancommander.server.kind (game or base), and com.lancommander.server.external-id.igdb, .steam or .gog for matching a server's game.
+                    Images a host has already are read from it. An index of every image's labels, as JSON, titles those it hasn't pulled; without one, they're titled from their repositories on GitHub.
+                </Typography>
+                <FormItem Label="Index URL" Class="edit-form-mono" Help='{ "images": [ { "name": "quake3", "labels": { "org.opencontainers.image.title": "Quake III Arena" } } ] }'>
+                    <Flex Gap="Gap.Small">
+                        <TextInput @bind-Value="_catalogUrl" Placeholder="None: titles from the images' labels and GitHub" />
+                        <Button OnClick="SaveCatalogUrl">Save</Button>
+                    </Flex>
+                </FormItem>
+            </Flex>
+        </Card>
     </Flex>
 </PageContent>
 
@@ -85,7 +101,29 @@
 
     static readonly string AddressHelp = $"{DockerHost.DefaultAddress} for the Docker daemon on this server; tcp://docker-host:2375 for another machine's. TLS connections aren't supported yet.";
 
-    protected override void OnInitialized() => Load();
+    string? _catalogUrl;
+
+    protected override void OnInitialized()
+    {
+        _catalogUrl = Settings.Current.ImageCatalogUrl;
+
+        Load();
+    }
+
+    void SaveCatalogUrl()
+    {
+        var url = _catalogUrl?.Trim() ?? "";
+
+        if (url.Length > 0 && !(Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https"))
+        {
+            Notifications.Error($"\"{url}\" isn't an http or https address.");
+            return;
+        }
+
+        Settings.Update(s => s.ImageCatalogUrl = url);
+
+        Notifications.Success(url.Length > 0 ? "Image catalog saved" : "Image catalog removed");
+    }
 
     bool IsNew(DockerHost host) => _hosts.All(h => h.Id != host.Id);
 

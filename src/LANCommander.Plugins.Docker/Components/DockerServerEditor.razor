@@ -2,6 +2,7 @@
 @inject DockerHosts Hosts
 @inject ContainerService Containers
 @inject NotificationService Notifications
+@inject IServiceProvider Services
 
 <div class="edit-form-pair">
     <FormItem Label="Docker host">
@@ -74,10 +75,18 @@
                 <FormItem Label="Name" Class="edit-form-mono">
                     <TextInput @bind-Value="creating.Name" />
                 </FormItem>
-                <FormItem Label="Image" Class="edit-form-mono" Help="Pulled if the host doesn't have it. LANCommander's server images are lancommander/<game>.">
-                    <TextInput @bind-Value="creating.Image" Placeholder="lancommander/quake3:latest" />
+                <FormItem Label="Image" Class="edit-form-mono" Help="Pulled if the host doesn't have it. Browse LANCommander's server images, or type any other.">
+                    <Flex Gap="Gap.Small">
+                        <TextInput @bind-Value="creating.Image" Placeholder="lancommander/quake3:latest" />
+                        <Button Icon="IconType.MagnifyingGlass" OnClick="() => _browsing = !_browsing">Browse</Button>
+                    </Flex>
                 </FormItem>
             </div>
+
+            @if (_browsing)
+            {
+                <ImagePicker HostId="creatingOn" GameTitle="@_gameTitle" GameIds="_gameIds" OnPick="PickImage" OnClose="() => _browsing = false" />
+            }
         }
 
         @if (_progress != null)
@@ -173,6 +182,11 @@
     ContainerDefinition? _draft;
     bool _creatingNow;
     string? _progress;
+
+    // Choosing the image from LANCommander's, and the server's game's title to suggest one by
+    bool _browsing;
+    string? _gameTitle;
+    IReadOnlyDictionary<string, string>? _gameIds;
 
     // Whether to install a new server's shared game files once it's created, and who else uses them
     bool _installGameFiles;
@@ -329,6 +343,47 @@
         _creating = new ContainerDefinition { Name = string.IsNullOrEmpty(name) ? "game-server" : name };
         _draft = null;
         _progress = null;
+        _browsing = true;
+
+        _ = LoadGameTitleAsync();
+    }
+
+    void PickImage(string image)
+    {
+        if (_creating != null)
+            _creating.Image = image;
+
+        _browsing = false;
+    }
+
+    /// <summary>The server's game's title and ids, for the picker to suggest its image by; none if the host can't say.</summary>
+    async Task LoadGameTitleAsync()
+    {
+        if (Context.Server.GameId is not { } gameId || Services.GetService(typeof(IGameProvider)) is not IGameProvider games)
+            return;
+
+        try
+        {
+            _gameTitle = (await games.GetAsync(gameId))?.Title;
+        }
+        catch (Exception)
+        {
+            // Not suggested by its title
+        }
+
+        try
+        {
+            _gameIds = (await games.GetExternalIdsAsync(gameId))
+                .Where(id => !string.IsNullOrWhiteSpace(id.Provider) && !string.IsNullOrWhiteSpace(id.ExternalId))
+                .GroupBy(id => id.Provider.Trim(), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().ExternalId.Trim(), StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception)
+        {
+            // Not suggested by its ids
+        }
+
+        await InvokeAsync(StateHasChanged);
     }
 
     void CancelCreating()

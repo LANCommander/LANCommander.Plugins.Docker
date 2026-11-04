@@ -11,6 +11,13 @@ public sealed class DockerSettings
     /// host removed since isn't brought back.
     /// </summary>
     public bool LegacyHostsImported { get; set; }
+
+    /// <summary>
+    /// Where to read an index of LANCommander's server images and their labels from, for titling and
+    /// matching images the Docker host hasn't pulled; empty to read only the host's images' labels.
+    /// See <see cref="Images.ImageLabels"/>.
+    /// </summary>
+    public string ImageCatalogUrl { get; set; } = "";
 }
 
 /// <summary>A Docker daemon the plugin connects to.</summary>

@@ -1,0 +1,187 @@
+@* LANCommander's server images, to choose one for a new container from *@
+@using LANCommander.Plugins.Docker.Images
+@inject ImageCatalog Catalog
+
+<Card Title="LANCommander server images" Subtitle="Published on Docker Hub, and those this host already has">
+    <Extra>
+        <Button Text Small Icon="IconType.X" title="Close" OnClick="OnClose" />
+    </Extra>
+    <ChildContent>
+        <Flex Vertical Gap="Gap.Small">
+            <TextInput @bind-Value="_search" Placeholder="Search by game or image" AutoFocus />
+
+            @if (_loading)
+            {
+                <Typography Secondary>Listing the images…</Typography>
+            }
+            else
+            {
+                @if (_error != null)
+                {
+                    <Alert Warning>@_error</Alert>
+                }
+
+                <div style="max-height: 24rem; overflow: auto;">
+                    <Flex Vertical Gap="Gap.Small">
+                        @foreach (var (heading, images) in Groups())
+                        {
+                            @if (heading != null)
+                            {
+                                <Typography Secondary Small>@heading</Typography>
+                            }
+
+                            @foreach (var image in images)
+                            {
+                                var suggested = ImageCatalog.IsFor(image, GameTitle, GameIds);
+
+                                <Flex Gap="Gap.Small" Align="Align.Center" Justify="Justify.SpaceBetween">
+                                    <Flex Vertical>
+                                        <span>
+                                            <Typography Strong>@image.Title</Typography>
+                                            <Typography Code>@image.Repository</Typography>
+                                            @if (suggested)
+                                            {
+                                                <Tag Primary Small>For @(GameTitle ?? "this server's game")</Tag>
+                                            }
+                                            @if (image.OnHost)
+                                            {
+                                                <Tag Success Small title="@string.Join(", ", image.LocalTags)">On this host</Tag>
+                                            }
+                                        </span>
+                                        @if (!string.IsNullOrWhiteSpace(image.Description) || image.Updated != null)
+                                        {
+                                            <Typography Secondary Small>
+                                                @image.Description
+                                                @if (image.Updated is { } updated)
+                                                {
+                                                    <span> · Updated @updated.ToLocalTime().ToString("d")</span>
+                                                }
+                                            </Typography>
+                                        }
+                                    </Flex>
+                                    <Button Small Primary="suggested" OnClick="() => ChooseAsync(image)" Loading="_choosing == image.Name">Use</Button>
+                                </Flex>
+
+                                @if (_tagsFor == image.Name && _tags.Count > 1)
+                                {
+                                    <Flex Gap="Gap.Small" Align="Align.Center">
+                                        <Typography Secondary Small>Tag</Typography>
+                                        <Select TValue="string" Items="_tags.Select(t => new SelectItem<string>(t, t)).ToList()" Value="_tag" ValueChanged="tag => _tag = tag" />
+                                        <Button Small Primary OnClick="() => PickAsync(image, _tag)">Use @image.Name:@_tag</Button>
+                                    </Flex>
+                                }
+                            }
+                        }
+
+                        @if (!Groups().Any())
+                        {
+                            <Typography Secondary>No images match. An image that isn't listed can still be typed in.</Typography>
+                        }
+                    </Flex>
+                </div>
+            }
+        </Flex>
+    </ChildContent>
+</Card>
+
+@code {
+    [Parameter, EditorRequired] public Guid HostId { get; set; }
+
+    /// <summary>The title of the server's game, to suggest its image.</summary>
+    [Parameter] public string? GameTitle { get; set; }
+
+    /// <summary>The server's game's ids, by provider as LANCommander names them, to suggest its image by.</summary>
+    [Parameter] public IReadOnlyDictionary<string, string>? GameIds { get; set; }
+
+    /// <summary>Told the image chosen, as a reference with its tag.</summary>
+    [Parameter] public EventCallback<string> OnPick { get; set; }
+
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    IReadOnlyList<CatalogImage> _images = [];
+    string? _error;
+    bool _loading = true;
+    string? _search;
+
+    // An image with more than one tag, while one is chosen
+    string? _choosing;
+    string? _tagsFor;
+    IReadOnlyList<string> _tags = [];
+    string _tag = "latest";
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            var result = await Catalog.ListAsync(HostId);
+
+            _images = result.Images;
+            _error = result.Error;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    /// <summary>The images that match the search: the game's own first, then games, then the base images.</summary>
+    IEnumerable<(string? Heading, IReadOnlyList<CatalogImage> Images)> Groups()
+    {
+        var matching = _images.Where(Matches).ToList();
+        var suggested = matching.Where(i => ImageCatalog.IsFor(i, GameTitle, GameIds)).ToList();
+        var games = matching.Where(i => !i.IsBase && !suggested.Contains(i)).ToList();
+        var bases = matching.Where(i => i.IsBase && !suggested.Contains(i)).ToList();
+
+        if (suggested.Count > 0)
+            yield return (null, suggested);
+
+        if (games.Count > 0)
+            yield return (suggested.Count > 0 ? "Other games" : null, games);
+
+        if (bases.Count > 0)
+            yield return ("Base images, which run a game they're told to: set it up with their environment", bases);
+    }
+
+    bool Matches(CatalogImage image)
+    {
+        if (string.IsNullOrWhiteSpace(_search))
+            return true;
+
+        var search = _search.Trim();
+
+        return image.Title.Contains(search, StringComparison.CurrentCultureIgnoreCase)
+            || image.Name.Contains(search.Replace(" ", ""), StringComparison.OrdinalIgnoreCase)
+            || image.Description.Contains(search, StringComparison.CurrentCultureIgnoreCase);
+    }
+
+    /// <summary>Uses the image's latest tag, or asks which if it has others.</summary>
+    async Task ChooseAsync(CatalogImage image)
+    {
+        _choosing = image.Name;
+
+        try
+        {
+            var tags = await Catalog.TagsAsync(HostId, image.Name);
+
+            if (tags.Count <= 1)
+            {
+                await PickAsync(image, tags.FirstOrDefault() ?? "latest");
+                return;
+            }
+
+            _tagsFor = image.Name;
+            _tags = tags;
+            _tag = tags.Contains("latest") ? "latest" : tags[0];
+        }
+        finally
+        {
+            _choosing = null;
+        }
+    }
+
+    Task PickAsync(CatalogImage image, string tag) => OnPick.InvokeAsync($"{image.Repository}:{tag}");
+}

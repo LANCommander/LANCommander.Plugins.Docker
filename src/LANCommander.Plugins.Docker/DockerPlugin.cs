@@ -56,6 +56,7 @@ public sealed class DockerPlugin : IPlugin
     {
         services.AddSingleton<DockerHosts>();
         services.AddSingleton<ContainerService>();
+        services.AddSingleton<Images.ImageCatalog>();
         services.AddSingleton<DockerServerEngine>();
     }
 

@@ -233,6 +233,57 @@ public sealed class PageTests : BunitContext
     }
 
     [Fact]
+    public async Task AnImageIsPickedWithTheServersGameFirst()
+    {
+        // Docker Hub as it lists LANCommander's images; no GitHub, and a host that can't be reached
+        Services.AddSingleton(new LANCommander.Plugins.Docker.Images.ImageCatalog(
+            TestHosts.Create(),
+            new MemorySettings<DockerSettings>(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<LANCommander.Plugins.Docker.Images.ImageCatalog>.Instance,
+            new HttpClient(new HubOnly("""
+                { "next": null, "results": [
+                  { "name": "quake3", "description": "" },
+                  { "name": "deusex", "description": "" },
+                  { "name": "wine", "description": "" }
+                ] }
+                """))));
+
+        string? picked = null;
+
+        var picker = Render<ImagePicker>(parameters => parameters
+            .Add(p => p.HostId, Guid.NewGuid())
+            .Add(p => p.GameTitle, "Deus Ex")
+            .Add(p => p.OnPick, (string image) => picked = image));
+
+        picker.WaitForAssertion(() => Assert.Contains("lancommander/deusex", picker.Markup));
+
+        // The game's own first, then the others, then the base images
+        var markup = picker.Markup;
+
+        Assert.True(markup.IndexOf("lancommander/deusex", StringComparison.Ordinal) < markup.IndexOf("lancommander/quake3", StringComparison.Ordinal));
+        Assert.True(markup.IndexOf("lancommander/quake3", StringComparison.Ordinal) < markup.IndexOf("lancommander/wine", StringComparison.Ordinal));
+        Assert.Contains("For Deus Ex", markup);
+
+        // Searching narrows it down
+        await picker.InvokeAsync(() => picker.FindComponents<LANCommander.Server.UI.Controls.TextInput>().First().Instance.ValueChanged.InvokeAsync("quake"));
+
+        picker.WaitForAssertion(() => Assert.DoesNotContain("lancommander/deusex", picker.Markup));
+
+        await picker.FindAll("button").Single(b => b.TextContent.Trim() == "Use").ClickAsync(new());
+
+        picker.WaitForAssertion(() => Assert.Equal("lancommander/quake3:latest", picked));
+    }
+
+    /// <summary>Docker Hub's answer to every request for it; anything else can't be reached.</summary>
+    private sealed class HubOnly(string json) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            request.RequestUri!.Host == "hub.docker.com" && !request.RequestUri.AbsolutePath.Contains("/tags")
+                ? Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent(json) })
+                : throw new HttpRequestException("No such host is known.");
+    }
+
+    [Fact]
     public void TheContainerPageAsksForAContainerFirst()
     {
         var page = Render<ContainerSection>(parameters => parameters.Add(p => p.Server, new ServerEngineServer { Id = Guid.NewGuid() }));
