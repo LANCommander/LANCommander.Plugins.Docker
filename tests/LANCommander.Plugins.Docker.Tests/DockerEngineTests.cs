@@ -522,6 +522,146 @@ public sealed class DockerEngineTests : IAsyncLifetime
         await client.Volumes.RemoveAsync(gameFiles, force: true);
     }
 
+    /// <summary>Runs busybox to its end with the folders bound, as the test's, and gives how it exited.</summary>
+    private async Task<long> RunAsync(string command, params string[] binds)
+    {
+        var client = _hosts.GetClient(_host.Id);
+        var created = await client.Containers.CreateContainerAsync(new CreateContainerParameters
+        {
+            Name = $"{_name}-run-{Guid.NewGuid():N}",
+            Image = Image,
+            Cmd = ["sh", "-c", command],
+            HostConfig = new HostConfig { Binds = binds },
+        });
+
+        try
+        {
+            await client.Containers.StartContainerAsync(created.ID, new ContainerStartParameters());
+
+            return (await client.Containers.WaitContainerAsync(created.ID)).StatusCode;
+        }
+        finally
+        {
+            await client.Containers.RemoveContainerAsync(created.ID, new ContainerRemoveParameters { Force = true });
+        }
+    }
+
+    [DockerFact]
+    public async Task AContainerIsRemovedWithTheFilesChosen()
+    {
+        var client = _hosts.GetClient(_host.Id);
+
+        // A data folder on the Docker host itself, in Docker Desktop's machine where there is one
+        var dataFolder = $"/tmp/{_name}";
+        var ownFiles = $"{dataFolder}/quake3/{_name}";
+        var maps = _name + "-maps";
+
+        _host.DataFolder = dataFolder;
+
+        try
+        {
+            await client.Containers.CreateContainerAsync(new CreateContainerParameters
+            {
+                Name = _name,
+                Image = Image,
+                Cmd = ["sh", "-c", "echo own > /config/own; echo map > /maps/map; echo data > /data/data; sleep 600"],
+                // A volume Docker names itself, as an image's VOLUME gets
+                Volumes = new Dictionary<string, EmptyStruct> { ["/data"] = default },
+                HostConfig = new HostConfig { Binds = [$"{ownFiles}:/config", $"{maps}:/maps"] },
+                Labels = new Dictionary<string, string> { [ContainerService.ManagedLabel] = "true" },
+            });
+            await client.Containers.StartContainerAsync(_name, new ContainerStartParameters());
+
+            var plan = await _containers.PlanRemovalAsync(_host.Id, _name);
+
+            Assert.True(plan.Running);
+            Assert.Equal(3, plan.Mounts.Count);
+            Assert.All(plan.Mounts, m => Assert.True(m.CanRemove, m.CantRemove));
+
+            var anonymous = Assert.Single(plan.Mounts, m => m.RemoveByDefault).Mount.Source;
+
+            var removed = await _containers.RemoveAsync(_host.Id, _name, plan.Mounts.Select(m => m.Mount.Source).ToList());
+
+            Assert.Empty(removed.Failed);
+            Assert.Equal(3, removed.Removed.Count);
+
+            var all = await client.Containers.ListContainersAsync(new ContainersListParameters { All = true });
+
+            Assert.DoesNotContain(all, c => c.Names.Any(n => n.TrimStart('/') == _name));
+
+            await Assert.ThrowsAnyAsync<DockerApiException>(() => client.Volumes.InspectAsync(maps));
+            await Assert.ThrowsAnyAsync<DockerApiException>(() => client.Volumes.InspectAsync(anonymous));
+
+            // The server's folder is gone, and the game's folder it was in is left
+            Assert.Equal(0, await RunAsync($"[ ! -e /check/{_name} ]", $"{dataFolder}/quake3:/check"));
+        }
+        finally
+        {
+            await RunAsync($"rm -rf /check/{_name}", "/tmp:/check");
+        }
+    }
+
+    [DockerFact]
+    public async Task FilesAnotherServerUsesAreNotRemoved()
+    {
+        var client = _hosts.GetClient(_host.Id);
+        var shared = _name + "-base";
+
+        foreach (var server in new[] { "-ctf", "-dm" })
+        {
+            await _containers.CreateAsync(_host.Id, new ContainerDefinition
+            {
+                Name = _name + server,
+                Image = Image,
+                Command = "sleep 600",
+                Mounts = [new VolumeMount { Source = shared, Destination = "/config/Server" }],
+            });
+        }
+
+        var plan = await _containers.PlanRemovalAsync(_host.Id, _name + "-dm");
+
+        Assert.Contains($"{_name}-ctf (stopped)", Assert.Single(plan.Mounts).CantRemove);
+
+        // Asked for anyway, nothing is removed
+        await Assert.ThrowsAsync<InvalidOperationException>(() => _containers.RemoveAsync(_host.Id, _name + "-dm", [shared]));
+
+        await client.Containers.InspectContainerAsync(_name + "-dm");
+
+        // Without it, the container goes and the files stay for the other
+        var removed = await _containers.RemoveAsync(_host.Id, _name + "-dm", []);
+
+        Assert.Empty(removed.Removed);
+        await client.Volumes.InspectAsync(shared);
+
+        await client.Containers.RemoveContainerAsync(_name + "-ctf", new ContainerRemoveParameters { Force = true });
+        await client.Volumes.RemoveAsync(shared, force: true);
+    }
+
+    [DockerFact]
+    public async Task OnlyThePluginsOwnContainersAreListedAsUnused()
+    {
+        var client = _hosts.GetClient(_host.Id);
+
+        await _containers.CreateAsync(_host.Id, new ContainerDefinition { Name = _name + "-ours", Image = Image, Command = "sleep 600" });
+        await client.Containers.CreateContainerAsync(new CreateContainerParameters { Name = _name + "-theirs", Image = Image, Cmd = ["sleep", "600"] });
+
+        var unused = await _containers.ListUnusedAsync(_host.Id, []);
+
+        Assert.Contains(unused, c => c.Name == _name + "-ours");
+        Assert.DoesNotContain(unused, c => c.Name == _name + "-theirs");
+
+        // Named by a server, by name or by id, it's in use
+        var ours = await client.Containers.InspectContainerAsync(_name + "-ours");
+
+        Assert.DoesNotContain(await _containers.ListUnusedAsync(_host.Id, [_name + "-ours"]), c => c.Name == _name + "-ours");
+        Assert.DoesNotContain(await _containers.ListUnusedAsync(_host.Id, [ours.ID[..12]]), c => c.Name == _name + "-ours");
+
+        // and it's still the plugin's once replaced
+        await _containers.RecreateAsync(_host.Id, _name + "-ours", await _containers.DefinitionOfAsync(_host.Id, ours));
+
+        Assert.Contains(await _containers.ListUnusedAsync(_host.Id, []), c => c.Name == _name + "-ours");
+    }
+
     [DockerFact]
     public async Task AContainerThatCannotBeReplacedIsPutBack()
     {

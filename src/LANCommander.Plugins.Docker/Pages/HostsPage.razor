@@ -1,7 +1,10 @@
 @page "/Plugins/Docker/Hosts"
+@using LANCommander.Plugins.Docker.Components
 @inject DockerHosts Hosts
 @inject NotificationService Notifications
 @inject LANCommander.SDK.Plugins.IPluginSettings<DockerSettings> Settings
+@inject ContainerService Containers
+@inject IServerProvider Servers
 
 <PageHeader Title="Docker Hosts" Subtitle="The Docker daemons game servers can run on">
     <Extra>
@@ -73,6 +76,43 @@
             </Columns>
         </Table>
 
+        <Card Title="Containers no server uses" Subtitle="Created for servers that have since been deleted or given another container or engine">
+            <Extra>
+                <Button Text Small Icon="IconType.ArrowClockwise" title="Refresh" Loading="_loadingUnused" OnClick="LoadUnusedAsync" />
+            </Extra>
+            <ChildContent>
+                <Flex Vertical Gap="Gap.Small">
+                    <Typography Secondary Small>Only containers this plugin created are listed; those made otherwise, such as with compose, are left alone.</Typography>
+
+                    @if (_unusedError != null)
+                    {
+                        <Alert Warning>@_unusedError</Alert>
+                    }
+
+                    @if (!_loadingUnused && _unused.Count == 0)
+                    {
+                        <Typography Secondary>None.</Typography>
+                    }
+
+                    @foreach (var (host, container) in _unused)
+                    {
+                        <Flex Gap="Gap.Small" Align="Align.Center">
+                            <Typography Strong>@container.Name</Typography>
+                            <Typography Code>@container.Image</Typography>
+                            <Tag Success="@(container.State == "running")" Small>@container.Status</Tag>
+                            <Typography Secondary Small>on @host.Name</Typography>
+                            <Button Small Danger Text Icon="IconType.Trash" OnClick="() => _removing = (host.Id, container.Name)">Remove</Button>
+                        </Flex>
+
+                        @if (_removing == (host.Id, container.Name))
+                        {
+                            <RemoveContainerCard HostId="host.Id" Container="@container.Name" OnRemoved="_ => RemovedAsync()" OnClose="() => _removing = null" />
+                        }
+                    }
+                </Flex>
+            </ChildContent>
+        </Card>
+
         <Card Title="Image catalog" Subtitle="Where new servers' images are chosen from">
             <Flex Vertical Gap="Gap.Small">
                 <Typography Secondary Small>
@@ -102,6 +142,67 @@
     static readonly string AddressHelp = $"{DockerHost.DefaultAddress} for the Docker daemon on this server; tcp://docker-host:2375 for another machine's. TLS connections aren't supported yet.";
 
     string? _catalogUrl;
+
+    List<(DockerHost Host, ContainerSummary Container)> _unused = [];
+    (Guid Host, string Container)? _removing;
+    bool _loadingUnused;
+    string? _unusedError;
+
+    protected override Task OnInitializedAsync() => LoadUnusedAsync();
+
+    /// <summary>The plugin's containers on each host that no Docker server names.</summary>
+    async Task LoadUnusedAsync()
+    {
+        _loadingUnused = true;
+        _unusedError = null;
+
+        try
+        {
+            var servers = await Servers.GetAsync();
+
+            // The containers servers on the Docker engine name, on each host
+            var inUse = servers
+                .Where(s => s.EngineExtensionId == DockerServerEngine.EngineId && !string.IsNullOrWhiteSpace(s.EngineSettings))
+                .Select(s => ServerEngineSettings.Read<DockerServerSettings>(s.EngineSettings!))
+                .Where(s => s.HostId != null && !string.IsNullOrWhiteSpace(s.ContainerId))
+                .ToLookup(s => s.HostId!.Value, s => s.ContainerId);
+
+            var unused = new List<(DockerHost, ContainerSummary)>();
+            var unreachable = new List<string>();
+
+            foreach (var host in Hosts.All)
+            {
+                try
+                {
+                    unused.AddRange((await Containers.ListUnusedAsync(host.Id, inUse[host.Id].ToList())).Select(c => (host, c)));
+                }
+                catch (Exception)
+                {
+                    unreachable.Add(host.Name);
+                }
+            }
+
+            _unused = unused;
+
+            if (unreachable.Count > 0)
+                _unusedError = $"Not checked, as they couldn't be reached: {string.Join(", ", unreachable)}.";
+        }
+        catch (Exception ex)
+        {
+            _unusedError = $"The servers could not be read: {ex.Message}";
+        }
+        finally
+        {
+            _loadingUnused = false;
+        }
+    }
+
+    async Task RemovedAsync()
+    {
+        _removing = null;
+
+        await LoadUnusedAsync();
+    }
 
     protected override void OnInitialized()
     {

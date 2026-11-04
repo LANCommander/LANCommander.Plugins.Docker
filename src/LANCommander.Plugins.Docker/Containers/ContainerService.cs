@@ -442,6 +442,10 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
         var client = hosts.GetClient(hostId);
         var parameters = spec.ToCreateParameters();
 
+        // So it can be told from containers made otherwise, should no server use it any more
+        parameters.Labels ??= new Dictionary<string, string>();
+        parameters.Labels[ManagedLabel] = "true";
+
         await PullIfMissingAsync(client, parameters.Image, progress, cancellationToken);
 
         progress?.Report($"Creating {parameters.Name}");
@@ -451,6 +455,148 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
         logger.LogInformation("Created container {Container} from {Image}", parameters.Name, parameters.Image);
 
         return parameters.Name;
+    }
+
+    /// <summary>On the containers the plugin creates, and kept when they're replaced.</summary>
+    public const string ManagedLabel = "com.lancommander.docker.managed";
+
+    /// <summary>What removing the container would do: which of its files could go with it.</summary>
+    public async Task<RemovalPlan> PlanRemovalAsync(Guid hostId, string container, CancellationToken cancellationToken = default)
+    {
+        var client = hosts.GetClient(hostId);
+        var inspected = await client.Containers.InspectContainerAsync(container, cancellationToken);
+
+        return await PlanAsync(hostId, inspected, cancellationToken);
+    }
+
+    private async Task<RemovalPlan> PlanAsync(Guid hostId, ContainerInspectResponse container, CancellationToken cancellationToken)
+    {
+        // The others: this one's own mounts aren't shared with itself
+        var others = await ReadHostUsageAsync(hostId, [], container.ID, cancellationToken);
+
+        return new RemovalPlan(
+            container.Name.TrimStart('/'),
+            container.State?.Running == true,
+            ContainerRemoval.Plan(ContainerDefinition.From(container).Mounts, others, hosts.Find(hostId)?.DataFolder));
+    }
+
+    /// <summary>
+    /// Stops and removes the container, then the files of its mounts named in <paramref name="files"/>
+    /// (by their source, as <see cref="RemovalPlan"/> lists them), each only if it still may be. A
+    /// volume is removed by Docker; a folder on the host, by a one-off container of the removed one's
+    /// image that mounts the folder it's in. Files that can't be removed are reported, not thrown for.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">A file named can't be removed; nothing has been.</exception>
+    public async Task<ContainerRemoved> RemoveAsync(Guid hostId, string container, IReadOnlyCollection<string> files, IProgress<string>? progress = null, CancellationToken cancellationToken = default)
+    {
+        var client = hosts.GetClient(hostId);
+        var inspected = await client.Containers.InspectContainerAsync(container, cancellationToken);
+        var plan = await PlanAsync(hostId, inspected, cancellationToken);
+        var name = plan.Container;
+
+        // Checked again now, before anything is removed: another server may have taken it since
+        var chosen = new List<MountRemoval>();
+
+        foreach (var source in files.Distinct(StringComparer.Ordinal))
+        {
+            var mount = plan.Mounts.FirstOrDefault(m => m.Mount.Source == source)
+                ?? throw new InvalidOperationException($"{name} doesn't mount {source}.");
+
+            if (!mount.CanRemove)
+                throw new InvalidOperationException($"{source} can't be removed: {mount.CantRemove}");
+
+            chosen.Add(mount);
+        }
+
+        progress?.Report($"Removing {name}");
+
+        await client.Containers.RemoveContainerAsync(inspected.ID, new ContainerRemoveParameters { Force = true, RemoveVolumes = false }, cancellationToken);
+
+        logger.LogInformation("Removed container {Container}", name);
+
+        var removed = new List<string>();
+        var failed = new List<string>();
+
+        foreach (var mount in chosen)
+        {
+            var source = mount.Mount.Source.Trim();
+
+            try
+            {
+                progress?.Report($"Removing {source}");
+
+                if (mount.Kind == MountKind.Volume)
+                    await client.Volumes.RemoveAsync(source, force: false, cancellationToken);
+                else
+                    await DeleteFolderAsync(client, inspected.Image, source, cancellationToken);
+
+                removed.Add(source);
+
+                logger.LogInformation("Removed {Files}, which {Container} mounted", source, name);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex, "Could not remove {Files}, which {Container} mounted", source, name);
+
+                failed.Add($"{source}: {ex.Message}");
+            }
+        }
+
+        return new ContainerRemoved(name, removed, failed);
+    }
+
+    /// <summary>
+    /// Deletes a folder on the host, which Docker has no call for: a one-off container of the image
+    /// mounts the folder it's in and removes it, as root, since the server's files may be root's.
+    /// </summary>
+    private static async Task DeleteFolderAsync(DockerClient client, string image, string folder, CancellationToken cancellationToken)
+    {
+        var (parent, folderName) = ContainerRemoval.Split(folder);
+
+        var created = await client.Containers.CreateContainerAsync(new CreateContainerParameters
+        {
+            Name = $"lancommander-remove-{Guid.NewGuid():N}",
+            Image = image,
+            User = "0",
+            // Instead of the image's own, which would start its server; its command is dropped with it
+            Entrypoint = ["rm", "-rf", "--", $"/remove/{folderName}"],
+            HostConfig = new HostConfig { Binds = [$"{parent}:/remove"] },
+        }, cancellationToken);
+
+        try
+        {
+            await client.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), cancellationToken);
+
+            var exited = await WaitForExitAsync(client, created.ID, cancellationToken);
+
+            if (exited != 0)
+                throw new IOException($"rm exited with code {exited}.");
+        }
+        finally
+        {
+            await client.Containers.RemoveContainerAsync(created.ID, new ContainerRemoveParameters { Force = true }, CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// The containers the plugin created on the host that no server uses: none of
+    /// <paramref name="inUse"/>, the containers servers name, by name or id.
+    /// </summary>
+    public async Task<IReadOnlyList<ContainerSummary>> ListUnusedAsync(Guid hostId, IReadOnlyCollection<string> inUse, CancellationToken cancellationToken = default)
+    {
+        var containers = await hosts.GetClient(hostId).Containers.ListContainersAsync(new ContainersListParameters { All = true }, cancellationToken);
+
+        return containers
+            .Where(c => c.Labels?.ContainsKey(ManagedLabel) == true)
+            .Where(c => !inUse.Any(used => IsContainer(c, used)))
+            .Select(c => new ContainerSummary(
+                c.ID,
+                c.Names?.FirstOrDefault()?.TrimStart('/') ?? c.ID[..Math.Min(12, c.ID.Length)],
+                c.Image,
+                c.State,
+                c.Status))
+            .OrderBy(c => c.Name, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
     }
 
     /// <summary>

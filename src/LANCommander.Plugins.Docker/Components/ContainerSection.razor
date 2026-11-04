@@ -28,6 +28,11 @@ else if (_spec is { } spec && Settings.HostId is { } hostId)
 
         <GameFilesLog Lines="_gameFilesLog" OnClose="() => _gameFilesLog = []" />
 
+        @if (_removeOpen)
+        {
+            <RemoveContainerCard HostId="hostId" Container="@Settings.ContainerId" OnRemoved="RemovedAsync" OnClose="() => _removeOpen = false" />
+        }
+
         @if (_uploadOpen && TakesGameFiles(spec))
         {
             <Card Title="Upload game files" Subtitle="@($"A ZIP of the game's files, put in {(spec.GameFiles?.Source ?? "the server's Server folder")}")">
@@ -68,6 +73,7 @@ else if (_spec is { } spec && Settings.HostId is { } hostId)
                     <Button Icon="IconType.UploadSimple" Disabled="Busy" OnClick="() => _uploadOpen = !_uploadOpen">Upload Game Files</Button>
                 }
                 <Button Disabled="Busy" OnClick="LoadAsync">Discard</Button>
+                <Button Danger Text Icon="IconType.Trash" Disabled="Busy" OnClick="() => _removeOpen = !_removeOpen">Remove Container</Button>
             </Flex>
         </FormItem>
     </Form>
@@ -95,6 +101,8 @@ else if (_spec is { } spec && Settings.HostId is { } hostId)
     bool _uploading;
     bool _stripTopFolder = true;
     IBrowserFile? _zip;
+
+    bool _removeOpen;
 
     bool Busy => _applying || _updating || _updatingFiles || _uploading;
 
@@ -316,23 +324,44 @@ else if (_spec is { } spec && Settings.HostId is { } hostId)
     /// <summary>Points the server at the container that replaced its old one, and reads it.</summary>
     async Task ReplacedAsync(string name)
     {
-        // The server names the container; keep it pointing at the new one
-        if (name != Settings.ContainerId && await Servers.GetAsync(Server.Id) is { } server)
-        {
-            var settings = server.EngineSettings is { Length: > 0 } saved
-                ? ServerEngineSettings.Read<DockerServerSettings>(saved)
-                : Settings;
-
-            settings.ContainerId = name;
-
-            await Servers.UpdateAsync(server with { EngineSettings = ServerEngineSettings.Write(settings) });
-
-            Settings = settings;
-        }
-
+        await PointAtAsync(name);
         await LoadAsync();
 
         if (_form != null)
             await _form.LoadUsesAsync();
+    }
+
+    /// <summary>Keeps the server pointing at its container, which the server names: a replacement's, or none once it's removed.</summary>
+    async Task PointAtAsync(string name)
+    {
+        if (name == Settings.ContainerId)
+            return;
+
+        // Not saved yet: only this page knows
+        if (await Servers.GetAsync(Server.Id) is not { } server)
+        {
+            Settings.ContainerId = name;
+            return;
+        }
+
+        var settings = server.EngineSettings is { Length: > 0 } saved
+            ? ServerEngineSettings.Read<DockerServerSettings>(saved)
+            : Settings;
+
+        settings.ContainerId = name;
+
+        await Servers.UpdateAsync(server with { EngineSettings = ServerEngineSettings.Write(settings) });
+
+        Settings = settings;
+    }
+
+    /// <summary>Once the container's removed, the server has none, until another is chosen on its General page.</summary>
+    async Task RemovedAsync(ContainerRemoved removed)
+    {
+        _removeOpen = false;
+        _spec = null;
+
+        await PointAtAsync("");
+        await LoadAsync();
     }
 }

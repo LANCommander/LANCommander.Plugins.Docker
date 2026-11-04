@@ -283,6 +283,45 @@ public sealed class PageTests : BunitContext
                 : throw new HttpRequestException("No such host is known.");
     }
 
+    [DockerFact]
+    public async Task AContainerNoServerUsesIsListedAndRemoved()
+    {
+        _settings.Current.Hosts.Add(_local);
+
+        await Services.GetRequiredService<ContainerService>().CreateAsync(_local.Id, new ContainerDefinition { Name = _name, Image = DockerEngineTests.Image, Command = "sleep 600" });
+
+        var page = Render<HostsPage>();
+
+        page.WaitForAssertion(() => Assert.Contains(_name, page.Markup));
+
+        await page.FindAll("button").Single(b => b.TextContent.Trim() == "Remove" && b.ParentElement!.TextContent.Contains(_name)).ClickAsync(new());
+
+        // The removal card, then its confirmation
+        page.WaitForAssertion(() => Assert.Contains($"Remove {_name}", page.Markup));
+
+        var card = page.FindComponent<RemoveContainerCard>();
+
+        // Once it's read what the container has
+        card.WaitForState(() => card.FindComponents<LANCommander.Server.UI.Controls.Popconfirm>().Count > 0);
+
+        await page.InvokeAsync(() => card.FindComponent<LANCommander.Server.UI.Controls.Popconfirm>().Instance.OnConfirm.InvokeAsync());
+
+        page.WaitForAssertion(() => Assert.DoesNotContain(_name, page.Markup));
+
+        var containers = await Services.GetRequiredService<ContainerService>().ListAsync(_local.Id);
+
+        Assert.DoesNotContain(containers, c => c.Name == _name);
+    }
+
+    [Fact]
+    public void WithoutUnusedContainersTheHostsPageSaysSo()
+    {
+        var page = Render<HostsPage>();
+
+        page.WaitForAssertion(() => Assert.Contains("Containers no server uses", page.Markup));
+        Assert.Contains("None.", page.Markup);
+    }
+
     [Fact]
     public void TheContainerPageAsksForAContainerFirst()
     {

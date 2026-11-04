@@ -1,0 +1,154 @@
+@* Removes a container, with whichever of its files the administrator chooses that may go with it *@
+@inject ContainerService Containers
+@inject NotificationService Notifications
+
+<Card Title="@($"Remove {Container}")" Subtitle="The container is stopped and removed. Its files are kept unless chosen below.">
+    <Extra>
+        <Button Text Small Icon="IconType.X" title="Close" Disabled="_removing" OnClick="OnClose" />
+    </Extra>
+    <ChildContent>
+        @if (_error != null)
+        {
+            <Alert Danger>@_error</Alert>
+        }
+        else if (_plan is not { } plan)
+        {
+            <Typography Secondary>Reading the container…</Typography>
+        }
+        else
+        {
+            <Flex Vertical Gap="Gap.Small">
+                @if (plan.Running)
+                {
+                    <Alert Warning>@plan.Container is running. It's stopped first, and anyone playing on it is disconnected.</Alert>
+                }
+
+                @if (plan.Mounts.Count == 0)
+                {
+                    <Typography Secondary Small>It has no volumes or folders of its own.</Typography>
+                }
+                else
+                {
+                    <Typography Secondary Small>Also remove:</Typography>
+
+                    @foreach (var mount in plan.Mounts)
+                    {
+                        var source = mount.Mount.Source;
+
+                        <Flex Vertical>
+                            <Checkbox Value="_chosen.Contains(source)" ValueChanged="(bool on) => Choose(source, on)" Disabled="!mount.CanRemove || _removing">
+                                <Typography Code>@source</Typography>
+                                <span> → @mount.Mount.Destination</span>
+                                <span> (@(mount.Kind == MountKind.Folder ? "a folder on the host" : mount.IsAnonymous ? "a volume Docker made for the image" : "a volume"))</span>
+                            </Checkbox>
+
+                            @if (!mount.CanRemove)
+                            {
+                                <Typography Secondary Small>Kept: @mount.CantRemove</Typography>
+                            }
+                            else if (mount.IsGameFiles)
+                            {
+                                <Typography Warning Small>The game's files. No other server uses them now, but a new server of the game would have to install them again.</Typography>
+                            }
+                            else if (mount.Mount.Destination.Trim().TrimEnd('/') == ContainerDefinition.ConfigFolder)
+                            {
+                                <Typography Secondary Small>The server's own files: its configuration, overlay and anything uploaded to it.</Typography>
+                            }
+                        </Flex>
+                    }
+                }
+
+                @if (_chosen.Count > 0)
+                {
+                    <Typography Danger Small>@_chosen.Count of these will be deleted, and can't be brought back.</Typography>
+                }
+
+                @if (_progress != null)
+                {
+                    <Typography Secondary>@_progress</Typography>
+                }
+
+                <Flex Gap="Gap.Small">
+                    <Popconfirm OnConfirm="RemoveAsync" Title="@($"Remove {plan.Container}?")" Description="@(_chosen.Count > 0 ? "Its container and the files chosen are deleted." : "Its container is deleted; its files are kept.")" OkText="Remove" Danger>
+                        <Button Danger Icon="IconType.Trash" Loading="_removing">Remove</Button>
+                    </Popconfirm>
+                    <Button Text Disabled="_removing" OnClick="OnClose">Cancel</Button>
+                </Flex>
+            </Flex>
+        }
+    </ChildContent>
+</Card>
+
+@code {
+    [Parameter, EditorRequired] public Guid HostId { get; set; }
+
+    /// <summary>The container, by name or id.</summary>
+    [Parameter, EditorRequired] public string Container { get; set; } = "";
+
+    /// <summary>Told what was removed, once the container is gone.</summary>
+    [Parameter] public EventCallback<ContainerRemoved> OnRemoved { get; set; }
+
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    RemovalPlan? _plan;
+    readonly HashSet<string> _chosen = new(StringComparer.Ordinal);
+    bool _removing;
+    string? _error;
+    string? _progress;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _plan = await Containers.PlanRemovalAsync(HostId, Container);
+
+            foreach (var mount in _plan.Mounts.Where(m => m.RemoveByDefault))
+                _chosen.Add(mount.Mount.Source);
+        }
+        catch (Exception ex)
+        {
+            _error = $"The container could not be read: {ex.Message}";
+        }
+    }
+
+    void Choose(string source, bool on)
+    {
+        if (on)
+            _chosen.Add(source);
+        else
+            _chosen.Remove(source);
+    }
+
+    async Task RemoveAsync()
+    {
+        if (_removing)
+            return;
+
+        _removing = true;
+
+        try
+        {
+            var removed = await Containers.RemoveAsync(HostId, Container, _chosen.ToList(), new Progress<string>(message => InvokeAsync(() =>
+            {
+                _progress = message;
+                StateHasChanged();
+            })));
+
+            if (removed.Failed.Count > 0)
+                Notifications.Error($"{removed.Container} was removed, but not all its files could be: {string.Join("; ", removed.Failed)}");
+            else
+                Notifications.Success(removed.Removed.Count > 0 ? $"{removed.Container} and {removed.Removed.Count} of its volumes or folders removed" : $"{removed.Container} removed");
+
+            await OnRemoved.InvokeAsync(removed);
+        }
+        catch (Exception ex)
+        {
+            Notifications.Error(ex, "The container could not be removed");
+        }
+        finally
+        {
+            _removing = false;
+            _progress = null;
+        }
+    }
+}
