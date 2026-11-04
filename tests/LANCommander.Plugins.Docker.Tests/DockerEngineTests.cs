@@ -144,8 +144,11 @@ public sealed class DockerEngineTests : IAsyncLifetime
         await foreach (var line in _engine.ReadLogAsync(server, ContainerConsoles.LogId, new ServerEngineLogRequest(Follow: false), CancellationToken.None))
             lines.Add(line);
 
-        Assert.Equal(["first", "second"], lines.Select(l => l.Text));
-        Assert.True(lines[1].IsError);
+        // Docker copies a container's output and error output separately, so lines written to each a
+        // moment apart can be logged in either order
+        Assert.Equal(["first", "second"], lines.Select(l => l.Text).Order());
+        Assert.True(lines.Single(l => l.Text == "second").IsError);
+        Assert.False(lines.Single(l => l.Text == "first").IsError);
         Assert.All(lines, l => Assert.NotNull(l.Timestamp));
     }
 

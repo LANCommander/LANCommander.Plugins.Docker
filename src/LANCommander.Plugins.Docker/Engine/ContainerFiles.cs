@@ -44,12 +44,14 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         exec cat -- "$1"
         """;
 
-    // Truncating in place keeps an existing file's owner and mode; a new one gets the container user's
+    // Truncating in place keeps an existing file's owner and mode; a new one gets the container user's.
+    // It reads exactly the file's length ($2) rather than to the end of its input: Docker Desktop's
+    // Windows pipe can lose the end of an exec's input if it arrives before the data has drained
     private const string WriteScript =
         """
         if [ -d "$1" ]; then echo "It is a folder." >&2; exit 3; fi
         mkdir -p -- "$(dirname -- "$1")" || exit 1
-        exec cat > "$1"
+        exec head -c "$2" > "$1"
         """;
 
     private const string DeleteScript =
@@ -65,7 +67,7 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         var (client, container, root) = await ResolveAsync(settings, cancellationToken);
         var target = InContainer(root, path);
 
-        var (output, error, exitCode) = await RunAsync(client, container, ListScript, target, null, cancellationToken);
+        var (output, error, exitCode) = await RunAsync(client, container, ListScript, [target], null, cancellationToken);
 
         ThrowIfFailed(exitCode, error, target, directory: true);
 
@@ -77,7 +79,7 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         var (client, container, root) = await ResolveAsync(settings, cancellationToken);
         var target = InContainer(root, path);
 
-        var (execId, stream) = await StartAsync(client, container, ReadScript, target, stdin: false, cancellationToken);
+        var (execId, stream) = await StartAsync(client, container, ReadScript, [target], stdin: false, cancellationToken);
         var reader = new ExecOutputStream(client, execId, stream, (exitCode, error) => ThrowIfFailed(exitCode, error, target, directory: false));
 
         try
@@ -100,9 +102,35 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         var (client, container, root) = await ResolveAsync(settings, cancellationToken);
         var target = InContainer(root, path);
 
-        var (_, error, exitCode) = await RunAsync(client, container, WriteScript, target, content, cancellationToken);
+        // Its length is passed with it, so a stream that can't tell it is kept on disk first
+        await using var buffered = content.CanSeek ? null : await BufferAsync(content, cancellationToken);
+        var input = buffered ?? content;
+        var length = input.Length - input.Position;
+
+        var (_, error, exitCode) = await RunAsync(client, container, WriteScript, [target, length.ToString(CultureInfo.InvariantCulture)], input, cancellationToken);
 
         ThrowIfFailed(exitCode, error, target, directory: false);
+    }
+
+    /// <summary>A copy of the stream in a temporary file, deleted when it's closed, from its start.</summary>
+    private static async Task<Stream> BufferAsync(Stream content, CancellationToken cancellationToken)
+    {
+        var file = new FileStream(Path.GetTempFileName(), FileMode.Open, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.DeleteOnClose | FileOptions.Asynchronous);
+
+        try
+        {
+            await content.CopyToAsync(file, cancellationToken);
+
+            file.Position = 0;
+
+            return file;
+        }
+        catch
+        {
+            await file.DisposeAsync();
+
+            throw;
+        }
     }
 
     public async Task DeleteAsync(DockerServerSettings settings, string path, CancellationToken cancellationToken)
@@ -113,7 +141,7 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         if (target == root)
             throw new InvalidOperationException("The server's files folder itself can't be deleted.");
 
-        var (_, error, exitCode) = await RunAsync(client, container, DeleteScript, target, null, cancellationToken);
+        var (_, error, exitCode) = await RunAsync(client, container, DeleteScript, [target], null, cancellationToken);
 
         ThrowIfFailed(exitCode, error, target, directory: false);
     }
@@ -123,7 +151,7 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         var (client, container, root) = await ResolveAsync(settings, cancellationToken);
         var target = InContainer(root, path);
 
-        var (_, error, exitCode) = await RunAsync(client, container, CreateDirectoryScript, target, null, cancellationToken);
+        var (_, error, exitCode) = await RunAsync(client, container, CreateDirectoryScript, [target], null, cancellationToken);
 
         ThrowIfFailed(exitCode, error, target, directory: true);
     }
@@ -241,9 +269,9 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         return (client, container.ID, RootOf(settings, container.Config?.WorkingDir));
     }
 
-    private static async Task<(string Output, string Error, long ExitCode)> RunAsync(DockerClient client, string container, string script, string target, Stream? input, CancellationToken cancellationToken)
+    private static async Task<(string Output, string Error, long ExitCode)> RunAsync(DockerClient client, string container, string script, string[] arguments, Stream? input, CancellationToken cancellationToken)
     {
-        var (execId, stream) = await StartAsync(client, container, script, target, stdin: input != null, cancellationToken);
+        var (execId, stream) = await StartAsync(client, container, script, arguments, stdin: input != null, cancellationToken);
 
         using (stream)
         {
@@ -260,15 +288,15 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         }
     }
 
-    private static async Task<(string ExecId, MultiplexedStream Stream)> StartAsync(DockerClient client, string container, string script, string target, bool stdin, CancellationToken cancellationToken)
+    private static async Task<(string ExecId, MultiplexedStream Stream)> StartAsync(DockerClient client, string container, string script, string[] arguments, bool stdin, CancellationToken cancellationToken)
     {
         var exec = await client.Exec.CreateContainerExecAsync(container, new ContainerExecCreateParameters
         {
             AttachStdin = stdin,
             AttachStdout = true,
             AttachStderr = true,
-            // The path is the script's $1, so it is never read as shell
-            Cmd = ["sh", "-c", script, "sh", target],
+            // The arguments are the script's $1, $2..., so they are never read as shell
+            Cmd = ["sh", "-c", script, "sh", .. arguments],
         }, cancellationToken);
 
         var stream = await client.Exec.StartContainerExecAsync(exec.ID, new ContainerExecStartParameters(), cancellationToken);

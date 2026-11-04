@@ -29,13 +29,12 @@ internal sealed class ContainerConsoles(DockerHosts hosts)
 
     // Shows the end of the file ($1, its last $2 lines), then follows it by name, so a log the server
     // rotates or makes again is still followed. Docker leaves an exec running when its connection
-    // closes, so tail runs in the background and is ended when the input does, which closing the
-    // console closes
+    // closes, and an end of its input can be lost on the way, so its process id comes first, for
+    // closing the console to end it by
     private const string FollowScript =
         """
-        tail -n "$2" -F -- "$1" & t=$!
-        cat >/dev/null
-        kill "$t" 2>/dev/null
+        echo "$$"
+        exec tail -n "$2" -F -- "$1"
         """;
 
     private const string TailScript = """exec tail -n "$2" -- "$1" """;
@@ -87,7 +86,6 @@ internal sealed class ContainerConsoles(DockerHosts hosts)
 
         var exec = await client.Exec.CreateContainerExecAsync(container.ID, new ContainerExecCreateParameters
         {
-            AttachStdin = request.Follow,
             AttachStdout = true,
             AttachStderr = true,
             Cmd = ["sh", "-c", request.Follow ? FollowScript : TailScript, "sh", path, tail.ToString(CultureInfo.InvariantCulture)],
@@ -95,25 +93,51 @@ internal sealed class ContainerConsoles(DockerHosts hosts)
 
         using var stream = await client.Exec.StartContainerExecAsync(exec.ID, new ContainerExecStartParameters(), cancellationToken);
 
+        // The tail following the file, which is ended when the console is
+        string? process = null;
+
         try
         {
             await foreach (var line in ReadLinesAsync(stream, cancellationToken))
+            {
+                if (request.Follow && process == null && !line.IsError)
+                {
+                    process = line.Text.Trim();
+                    continue;
+                }
+
                 yield return line;
+            }
         }
         finally
         {
-            // Ends the input, and so the tail following the file
-            if (request.Follow)
+            if (process != null && int.TryParse(process, NumberStyles.None, CultureInfo.InvariantCulture, out var pid))
+                await EndAsync(client, container.ID, pid);
+        }
+    }
+
+    /// <summary>Ends a process in the container, as far as it can be in a moment; one that's gone already is no matter.</summary>
+    private static async Task EndAsync(DockerClient client, string container, int pid)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            var kill = await client.Exec.CreateContainerExecAsync(container, new ContainerExecCreateParameters
             {
-                try
-                {
-                    stream.CloseWrite();
-                }
-                catch (Exception)
-                {
-                    // The connection is already gone, which ends it too
-                }
-            }
+                AttachStdout = true,
+                AttachStderr = true,
+                // The shell's own kill, for images without the program
+                Cmd = ["sh", "-c", """kill "$1" """, "sh", pid.ToString(CultureInfo.InvariantCulture)],
+            }, timeout.Token);
+
+            using var stream = await client.Exec.StartContainerExecAsync(kill.ID, new ContainerExecStartParameters(), timeout.Token);
+
+            await stream.ReadOutputToEndAsync(timeout.Token);
+        }
+        catch (Exception)
+        {
+            // The container stopped, or the tail ended on its own
         }
     }
 
@@ -131,20 +155,28 @@ internal sealed class ContainerConsoles(DockerHosts hosts)
             return [new ServerEngineLogLine($"{path} isn't in the stopped container. Files in an overlay mounted while it runs, such as /config/Merged, can only be read then; its files on disk, such as /config/Overlay, can be read now.", null, true)];
         }
 
+        // Docker.DotNet's response can't be read a tar entry at a time as it arrives, so it's kept in a
+        // temporary file first rather than in memory, as a log can be large
+        await using var copy = new FileStream(Path.GetTempFileName(), FileMode.Open, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.DeleteOnClose | FileOptions.Asynchronous);
+
         using (archive.Stream)
+            await archive.Stream.CopyToAsync(copy, cancellationToken);
+
+        copy.Position = 0;
+
         {
-            var reader = new System.Formats.Tar.TarReader(archive.Stream);
+            var reader = new System.Formats.Tar.TarReader(copy);
             var entry = await reader.GetNextEntryAsync(copyData: false, cancellationToken);
 
             if (entry?.DataStream == null)
                 return [new ServerEngineLogLine($"{path} isn't a file.", null, true)];
 
-            return TailOf(entry.DataStream, tail);
+            return await TailOfAsync(entry.DataStream, tail, cancellationToken);
         }
     }
 
-    /// <summary>The last lines of a stream of text.</summary>
-    internal static IReadOnlyList<ServerEngineLogLine> TailOf(Stream stream, int tail)
+    /// <summary>The last lines of a stream of text. Read asynchronously: a Docker response can only be.</summary>
+    internal static async Task<IReadOnlyList<ServerEngineLogLine>> TailOfAsync(Stream stream, int tail, CancellationToken cancellationToken = default)
     {
         var lines = new Queue<ServerEngineLogLine>();
         var reader = new LineReader(line =>
@@ -158,7 +190,7 @@ internal sealed class ContainerConsoles(DockerHosts hosts)
         var buffer = new byte[16 * 1024];
         int read;
 
-        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+        while ((read = await stream.ReadAsync(buffer, cancellationToken)) > 0)
             reader.Append(buffer, read);
 
         reader.Flush();

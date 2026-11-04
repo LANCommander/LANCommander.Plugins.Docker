@@ -64,9 +64,9 @@ public sealed class ContainerConsoleTests
     [InlineData("one\r\ntwo", 5, new[] { "one", "two" })]
     [InlineData("", 5, new string[0])]
     [InlineData("one\ntwo", 0, new string[0])]
-    public void TheEndOfAFileIsItsLastLines(string text, int tail, string[] lines)
+    public async Task TheEndOfAFileIsItsLastLines(string text, int tail, string[] lines)
     {
-        var read = ContainerConsoles.TailOf(new MemoryStream(Encoding.UTF8.GetBytes(text)), tail);
+        var read = await ContainerConsoles.TailOfAsync(new MemoryStream(Encoding.UTF8.GetBytes(text)), tail);
 
         Assert.Equal(lines, read.Select(l => l.Text));
         Assert.All(read, l => Assert.False(l.IsError));
