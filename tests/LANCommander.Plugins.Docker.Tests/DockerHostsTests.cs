@@ -87,4 +87,22 @@ public sealed class DockerHostsTests
 
         Assert.NotSame(first, hosts.GetClient(host.Id));
     }
+
+    [Fact]
+    public void HostsAreReplacedTogetherOrNotAtAll()
+    {
+        var kept = new DockerHost { Name = "Kept", Address = "tcp://kept:2375" };
+        var removed = new DockerHost { Name = "Removed", Address = "tcp://removed:2375" };
+        var hosts = TestHosts.Create(kept, removed);
+
+        // One bad host stops all of them being saved
+        Assert.Throws<DockerHostException>(() => hosts.Replace([kept, new DockerHost { Name = "Bad", Address = "not an address" }]));
+        Assert.Equal(["Kept", "Removed"], hosts.All.Select(h => h.Name));
+
+        hosts.Replace([new DockerHost { Id = kept.Id, Name = " Kept ", Address = "tcp://kept:2376" }, new DockerHost { Name = "Added", Address = "tcp://added:2375" }]);
+
+        Assert.Equal(["Added", "Kept"], hosts.All.Select(h => h.Name));
+        Assert.Equal("tcp://kept:2376", hosts.Find(kept.Id)!.Address);
+        Assert.Null(hosts.Find(removed.Id));
+    }
 }

@@ -74,6 +74,39 @@ public sealed class DockerHosts(IPluginSettings<DockerSettings> settings, ILogge
         });
     }
 
+    /// <summary>
+    /// Makes <paramref name="hosts"/> the hosts, as edited on Settings › Servers. Each is checked
+    /// before any is saved, so either all are or none.
+    /// </summary>
+    /// <exception cref="ArgumentException">A host has no name.</exception>
+    /// <exception cref="DockerHostException">A host's address isn't one.</exception>
+    public void Replace(IEnumerable<DockerHost> hosts)
+    {
+        var saved = hosts
+            .Select(host => new DockerHost { Id = host.Id, Name = host.Name?.Trim() ?? "", Address = host.Address?.Trim() ?? "", DataFolder = host.DataFolder?.Trim() ?? "" })
+            .ToList();
+
+        foreach (var host in saved)
+        {
+            if (host.Name.Length == 0)
+                throw new ArgumentException("A Docker host needs a name.", nameof(hosts));
+
+            CreateClient(host.Address).Dispose();
+        }
+
+        settings.Update(s =>
+        {
+            s.Hosts.Clear();
+            s.Hosts.AddRange(saved);
+        });
+
+        foreach (var id in _clients.Keys.Where(id => saved.All(h => h.Id != id)).ToList())
+        {
+            if (_clients.TryRemove(id, out var removed))
+                removed.Client.Dispose();
+        }
+    }
+
     public void Remove(Guid id)
     {
         settings.Update(s => s.Hosts.RemoveAll(h => h.Id == id));

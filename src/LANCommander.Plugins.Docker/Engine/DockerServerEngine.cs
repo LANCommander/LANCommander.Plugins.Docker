@@ -42,6 +42,8 @@ public sealed class DockerServerEngine(
 
     public Type? EditorComponent => typeof(DockerServerEditor);
 
+    public Type? SettingsComponent => typeof(DockerEngineSettings);
+
     public IReadOnlyList<ServerEngineSection> Sections { get; } = [new("Container", "Container", typeof(ContainerSection))];
 
     public Task InitializeAsync(IServerEngineHost host, CancellationToken cancellationToken)

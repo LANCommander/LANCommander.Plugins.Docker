@@ -41,24 +41,19 @@ public sealed class PluginLoadingTests : IDisposable
         // Registered as the host's interface types, so the server finds them
         Assert.Contains(services, service => service.ServiceType == typeof(IServerEngineExtension));
 
-        var navigation = services
-            .Where(service => service.ServiceType == typeof(IServerNavigationExtension))
-            .Select(service => (IServerNavigationExtension)Activator.CreateInstance(service.ImplementationType!, nonPublic: true)!)
-            .Single();
+        // Configured on Settings › Servers rather than a page of its own
+        Assert.DoesNotContain(services, service => service.ServiceType == typeof(IServerNavigationExtension));
+        Assert.DoesNotContain(services, service => service.ServiceType == typeof(IServerRouteAssemblyExtension));
 
-        Assert.Equal(DockerRoutes.Hosts, navigation.Href);
-        Assert.Equal(ServerNavigationSection.Settings, navigation.Section);
-        Assert.Equal("/Settings/Servers", navigation.After);
+        // The engine's registration is the plugin's own code, in the plugin's load context
+        var pluginAssembly = services.Single(service => service.ServiceType == typeof(IServerEngineExtension)).ImplementationFactory!.Method.DeclaringType!.Assembly;
 
-        var routes = (IServerRouteAssemblyExtension)services
-            .Single(service => service.ServiceType == typeof(IServerRouteAssemblyExtension)).ImplementationInstance!;
-
-        var pluginContext = AssemblyLoadContext.GetLoadContext(routes.Assembly);
+        var pluginContext = AssemblyLoadContext.GetLoadContext(pluginAssembly);
 
         Assert.IsType<PluginLoadContext>(pluginContext);
 
         // Every LANCommander assembly the plugin references resolves to the host's copy
-        foreach (var reference in routes.Assembly.GetReferencedAssemblies().Where(reference => reference.Name!.StartsWith("LANCommander.", StringComparison.Ordinal)))
+        foreach (var reference in pluginAssembly.GetReferencedAssemblies().Where(reference => reference.Name!.StartsWith("LANCommander.", StringComparison.Ordinal)))
         {
             var loaded = pluginContext!.LoadFromAssemblyName(reference);
 
@@ -73,9 +68,10 @@ public sealed class PluginLoadingTests : IDisposable
 
     [Theory]
     [InlineData("2.2.0-alpha.4", false)]
-    [InlineData("2.2.0-beta.1", true)]
+    [InlineData("2.2.0-beta.1", false)]
+    [InlineData("2.2.0-beta.3", true)]
     [InlineData("2.2.0", true)]
-    public void TheServerSkipsThePluginWhenItPredatesServerEngines(string hostVersion, bool loads)
+    public void TheServerSkipsThePluginWhenItPredatesServerEngineSettings(string hostVersion, bool loads)
     {
         var loader = new PluginLoaderService();
 

@@ -1,0 +1,391 @@
+@* The Docker engine's panel on Settings › Servers: the hosts it runs servers on, and its image catalog *@
+@implements IDisposable
+@inject DockerHosts Hosts
+@inject LANCommander.SDK.Plugins.IPluginSettings<DockerSettings> Settings
+@inject ContainerService Containers
+@inject IServerProvider Servers
+
+<Flex Vertical Gap="Gap.Large">
+    <Typography Secondary>
+        Choose Docker as a server's engine on its General page, then a host from here and one of its containers.
+        The server is configured from the container itself: its image, environment, ports and volumes are changed on the server's Container page.
+        Hosts and the image catalog are saved with the page.
+    </Typography>
+
+    <Flex Justify="Justify.End">
+        <Button Icon="IconType.Plus" OnClick="Add">Add Host</Button>
+    </Flex>
+
+    @if (_editing is { } editing)
+    {
+        <Card Title="@(IsNew(editing) ? "Add a Docker host" : $"Edit {Original(editing)?.Name}")">
+            <Form Model="editing" OnSubmit="Apply">
+                <FormItem Label="Name" Required>
+                    <TextInput @bind-Value="editing.Name" AutoFocus />
+                </FormItem>
+                <FormItem Label="Address" Required Help="@AddressHelp" Class="edit-form-mono">
+                    <TextInput @bind-Value="editing.Address" Placeholder="@DockerHost.DefaultAddress" />
+                </FormItem>
+                <FormItem Label="Data folder" Help="A folder on this Docker host that new servers keep their files in, each in a folder named after its container, such as /data/Servers. Leave empty to keep them in Docker volumes." Class="edit-form-mono">
+                    <TextInput @bind-Value="editing.DataFolder" Placeholder="/data/Servers" />
+                </FormItem>
+
+                @if (_formError != null)
+                {
+                    <Alert Danger>@_formError</Alert>
+                }
+                else if (_testResult != null)
+                {
+                    <Alert Success="_testSucceeded" Danger="!_testSucceeded">@_testResult</Alert>
+                }
+
+                <FormItem>
+                    <Flex Gap="Gap.Small">
+                        <Button Primary Submit>@(IsNew(editing) ? "Add" : "Done")</Button>
+                        <Button Loading="_testing" OnClick="TestAsync">Test Connection</Button>
+                        <Button Text OnClick="Cancel">Cancel</Button>
+                    </Flex>
+                </FormItem>
+            </Form>
+        </Card>
+    }
+
+    <Table TItem="DockerHost" Items="_hosts" Key="host => host.Id" NoPaging Small EmptyText="No Docker hosts. Add one to run servers in containers." SettingsKey="plugin-docker-hosts">
+        <Columns>
+            <TemplateColumn TItem="DockerHost" Title="Name">
+                <Typography Strong>@context.Name</Typography>
+                @if (!IsSaved(context))
+                {
+                    <Tag Small>Not saved</Tag>
+                }
+            </TemplateColumn>
+            <TemplateColumn TItem="DockerHost" Title="Address">
+                <Typography Code>@context.Address</Typography>
+            </TemplateColumn>
+            <TemplateColumn TItem="DockerHost" Title="Status" Width="320px">
+                @if (_status.TryGetValue(context.Id, out var status))
+                {
+                    <Tag Success="status.Reachable" Danger="!status.Reachable" title="@status.Message">@(status.Reachable ? status.Message : "Unreachable")</Tag>
+                }
+                else
+                {
+                    <Tag>Checking…</Tag>
+                }
+            </TemplateColumn>
+            <ActionsColumn TItem="DockerHost">
+                <Button Text Small Icon="IconType.PencilSimple" title="Edit" OnClick="() => Edit(context)" />
+                <Popconfirm OnConfirm="() => Remove(context)" Title="@($"Remove {context.Name}?")" Description="Once the page is saved, servers on it stop working until they are given another host. Its containers are left alone." OkText="Remove" Danger>
+                    <Button Text Small Danger Icon="IconType.Trash" title="Remove" />
+                </Popconfirm>
+            </ActionsColumn>
+        </Columns>
+    </Table>
+
+    <Card Title="Containers no server uses" Subtitle="Created for servers that have since been deleted or given another container or engine">
+        <Extra>
+            <Button Text Small Icon="IconType.ArrowClockwise" title="Refresh" Loading="_loadingUnused" OnClick="LoadUnusedAsync" />
+        </Extra>
+        <ChildContent>
+            <Flex Vertical Gap="Gap.Small">
+                <Typography Secondary Small>Only containers this plugin created, on saved hosts, are listed; those made otherwise, such as with compose, are left alone.</Typography>
+
+                @if (_unusedError != null)
+                {
+                    <Alert Warning>@_unusedError</Alert>
+                }
+
+                @if (!_loadingUnused && _unused.Count == 0)
+                {
+                    <Typography Secondary>None.</Typography>
+                }
+
+                @foreach (var (host, container) in _unused)
+                {
+                    <Flex Gap="Gap.Small" Align="Align.Center">
+                        <Typography Strong>@container.Name</Typography>
+                        <Typography Code>@container.Image</Typography>
+                        <Tag Success="@(container.State == "running")" Small>@container.Status</Tag>
+                        <Typography Secondary Small>on @host.Name</Typography>
+                        <Button Small Danger Text Icon="IconType.Trash" OnClick="() => _removing = (host.Id, container.Name)">Remove</Button>
+                    </Flex>
+
+                    @if (_removing == (host.Id, container.Name))
+                    {
+                        <RemoveContainerCard HostId="host.Id" Container="@container.Name" OnRemoved="_ => RemovedAsync()" OnClose="() => _removing = null" />
+                    }
+                }
+            </Flex>
+        </ChildContent>
+    </Card>
+
+    <Card Title="Image catalog" Subtitle="Where new servers' images are chosen from">
+        <Flex Vertical Gap="Gap.Small">
+            <Typography Secondary Small>
+                LANCommander's server images are listed from Docker Hub, titled by their labels: org.opencontainers.image.title and .description, com.lancommander.server.kind (game or base), and com.lancommander.server.external-id.igdb, .steam or .gog for matching a server's game.
+                Images a host has already are read from it. An index of every image's labels, as JSON, titles those it hasn't pulled; without one, they're titled from their repositories on GitHub.
+            </Typography>
+            <FormItem Label="Index URL" Class="edit-form-mono" Help='{ "images": [ { "name": "quake3", "labels": { "org.opencontainers.image.title": "Quake III Arena" } } ] }'>
+                <TextInput @bind-Value="_catalogUrl" Placeholder="None: titles from the images' labels and GitHub" />
+            </FormItem>
+        </Flex>
+    </Card>
+</Flex>
+
+@code {
+    /// <summary>Given by Settings › Servers, to save the hosts and catalog when the page is saved.</summary>
+    [Parameter] public ServerEngineSettingsContext Context { get; set; } = default!;
+
+    // The hosts as edited, written only when the page is saved
+    List<DockerHost> _hosts = [];
+    readonly Dictionary<Guid, (bool Reachable, string Message)> _status = new();
+
+    DockerHost? _editing;
+    string? _formError;
+    bool _testing;
+    bool _testSucceeded;
+    string? _testResult;
+
+    static readonly string AddressHelp = $"{DockerHost.DefaultAddress} for the Docker daemon on this server; tcp://docker-host:2375 for another machine's. TLS connections aren't supported yet.";
+
+    string? _catalogUrl;
+
+    List<(DockerHost Host, ContainerSummary Container)> _unused = [];
+    (Guid Host, string Container)? _removing;
+    bool _loadingUnused;
+    string? _unusedError;
+
+    IDisposable? _onSave;
+    IDisposable? _onAdd;
+
+    protected override void OnInitialized()
+    {
+        _hosts = Hosts.All.Select(Copy).ToList();
+        _catalogUrl = Settings.Current.ImageCatalogUrl;
+
+        foreach (var host in _hosts)
+            _ = CheckAsync(host);
+
+        _onSave = Context.OnSave(SaveAsync);
+
+        // Docker chosen from the page's Add menu: start adding a host
+        _onAdd = Context.OnAdd(() =>
+        {
+            Add();
+
+            return Task.CompletedTask;
+        });
+    }
+
+    protected override Task OnInitializedAsync() => LoadUnusedAsync();
+
+    public void Dispose()
+    {
+        _onSave?.Dispose();
+        _onAdd?.Dispose();
+    }
+
+    /// <summary>Writes the hosts and catalog as edited; throws, saving neither, if either is wrong.</summary>
+    async Task SaveAsync(CancellationToken cancellationToken)
+    {
+        var url = _catalogUrl?.Trim() ?? "";
+
+        if (url.Length > 0 && !(Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https"))
+            throw new InvalidOperationException($"The image catalog's index URL \"{url}\" isn't an http or https address.");
+
+        Hosts.Replace(_hosts);
+        Settings.Update(s => s.ImageCatalogUrl = url);
+
+        await Settings.FlushAsync(cancellationToken);
+
+        await InvokeAsync(async () =>
+        {
+            _hosts = Hosts.All.Select(Copy).ToList();
+            _catalogUrl = url;
+
+            StateHasChanged();
+
+            // Saved hosts may have containers no server uses
+            await LoadUnusedAsync();
+
+            StateHasChanged();
+        });
+    }
+
+    /// <summary>The plugin's containers on each saved host that no Docker server names.</summary>
+    async Task LoadUnusedAsync()
+    {
+        _loadingUnused = true;
+        _unusedError = null;
+
+        try
+        {
+            var servers = await Servers.GetAsync();
+
+            // The containers servers on the Docker engine name, on each host
+            var inUse = servers
+                .Where(s => s.EngineExtensionId == DockerServerEngine.EngineId && !string.IsNullOrWhiteSpace(s.EngineSettings))
+                .Select(s => ServerEngineSettings.Read<DockerServerSettings>(s.EngineSettings!))
+                .Where(s => s.HostId != null && !string.IsNullOrWhiteSpace(s.ContainerId))
+                .ToLookup(s => s.HostId!.Value, s => s.ContainerId);
+
+            var unused = new List<(DockerHost, ContainerSummary)>();
+            var unreachable = new List<string>();
+
+            foreach (var host in Hosts.All)
+            {
+                try
+                {
+                    unused.AddRange((await Containers.ListUnusedAsync(host.Id, inUse[host.Id].ToList())).Select(c => (host, c)));
+                }
+                catch (Exception)
+                {
+                    unreachable.Add(host.Name);
+                }
+            }
+
+            _unused = unused;
+
+            if (unreachable.Count > 0)
+                _unusedError = $"Not checked, as they couldn't be reached: {string.Join(", ", unreachable)}.";
+        }
+        catch (Exception ex)
+        {
+            _unusedError = $"The servers could not be read: {ex.Message}";
+        }
+        finally
+        {
+            _loadingUnused = false;
+        }
+    }
+
+    async Task RemovedAsync()
+    {
+        _removing = null;
+
+        await LoadUnusedAsync();
+    }
+
+    static DockerHost Copy(DockerHost host) => new() { Id = host.Id, Name = host.Name, Address = host.Address, DataFolder = host.DataFolder };
+
+    bool IsNew(DockerHost host) => Original(host) == null;
+
+    DockerHost? Original(DockerHost host) => _hosts.FirstOrDefault(h => h.Id == host.Id);
+
+    bool IsSaved(DockerHost host) => Hosts.Find(host.Id) is { } saved
+        && saved.Name == host.Name && saved.Address == host.Address && saved.DataFolder == host.DataFolder;
+
+    async Task CheckAsync(DockerHost host)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        try
+        {
+            _status[host.Id] = (true, await Hosts.TestAsync(host, timeout.Token));
+        }
+        catch (Exception ex)
+        {
+            _status[host.Id] = (false, ex.Message);
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    void Add()
+    {
+        _editing = new DockerHost
+        {
+            Name = _hosts.Count == 0 ? "Local" : "",
+            Address = _hosts.Count == 0 ? DockerHost.DefaultAddress : "",
+        };
+        _formError = null;
+        _testResult = null;
+    }
+
+    void Edit(DockerHost host)
+    {
+        _editing = Copy(host);
+        _formError = null;
+        _testResult = null;
+    }
+
+    void Cancel()
+    {
+        _editing = null;
+        _formError = null;
+        _testResult = null;
+    }
+
+    async Task TestAsync()
+    {
+        if (_editing == null)
+            return;
+
+        _testing = true;
+        _formError = null;
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        try
+        {
+            _testResult = $"Connected to {await Hosts.TestAsync(_editing, timeout.Token)}";
+            _testSucceeded = true;
+        }
+        catch (Exception ex)
+        {
+            _testResult = ex.Message;
+            _testSucceeded = false;
+        }
+        finally
+        {
+            _testing = false;
+        }
+    }
+
+    // Puts the host in the list, to be saved with the page
+    void Apply()
+    {
+        if (_editing is not { } editing)
+            return;
+
+        editing.Name = editing.Name?.Trim() ?? "";
+        editing.Address = editing.Address?.Trim() ?? "";
+        editing.DataFolder = editing.DataFolder?.Trim() ?? "";
+
+        if (editing.Name.Length == 0)
+        {
+            _formError = "A Docker host needs a name.";
+            return;
+        }
+
+        if (!Uri.TryCreate(editing.Address, UriKind.Absolute, out _))
+        {
+            _formError = $"\"{editing.Address}\" isn't a Docker address, such as {DockerHost.DefaultAddress} or tcp://docker-host:2375.";
+            return;
+        }
+
+        var index = _hosts.FindIndex(h => h.Id == editing.Id);
+
+        if (index >= 0)
+            _hosts[index] = editing;
+        else
+            _hosts.Add(editing);
+
+        _hosts = _hosts.OrderBy(h => h.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+
+        _status.Remove(editing.Id);
+        _ = CheckAsync(editing);
+
+        _editing = null;
+        _formError = null;
+        _testResult = null;
+    }
+
+    void Remove(DockerHost host)
+    {
+        _hosts = _hosts.Where(h => h.Id != host.Id).ToList();
+        _status.Remove(host.Id);
+
+        if (_editing?.Id == host.Id)
+            Cancel();
+    }
+}

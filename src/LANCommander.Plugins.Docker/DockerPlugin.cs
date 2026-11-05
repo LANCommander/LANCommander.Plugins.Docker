@@ -1,4 +1,3 @@
-using System.Reflection;
 using LANCommander.Plugins.Docker.Containers;
 using LANCommander.Plugins.Docker.Engine;
 using LANCommander.Plugins.Docker.Hosts;
@@ -10,15 +9,15 @@ using Microsoft.Extensions.Logging;
 [assembly: LANCommanderPlugin(
     typeof(LANCommander.Plugins.Docker.DockerPlugin),
     Id = LANCommander.Plugins.Docker.DockerPlugin.PluginId,
-    // IServerEngineExtension and its consoles arrive in 2.2.0-beta.1
-    MinHostVersion = "2.2.0-beta.1",
+    // IServerEngineExtension.SettingsComponent, where the plugin's hosts are configured, arrives in 2.2.0-beta.3
+    MinHostVersion = "2.2.0-beta.3",
     Hosts = PluginHost.Server)]
 
 namespace LANCommander.Plugins.Docker;
 
 /// <summary>
 /// Runs game servers as Docker containers. Adds a Docker engine to a server's General page, a page
-/// for each server's container, and Settings → Docker Hosts for the daemons it connects to.
+/// for each server's container, and the daemons it connects to under the engine on Settings › Servers.
 /// </summary>
 public sealed class DockerPlugin : IPlugin
 {
@@ -31,9 +30,6 @@ public sealed class DockerPlugin : IPlugin
 
     public void ConfigureServices(IServiceCollection services)
     {
-        services.AddSingleton<IServerRouteAssemblyExtension>(new DockerRouteAssembly());
-        services.AddSingleton<IServerNavigationExtension, HostsNavigation>();
-
         AddDockerServices(services);
 
         services.AddSingleton<IServerEngineExtension>(provider => provider.GetRequiredService<DockerServerEngine>());
@@ -59,25 +55,11 @@ public sealed class DockerPlugin : IPlugin
         services.AddSingleton<Images.ImageCatalog>();
         services.AddSingleton<DockerServerEngine>();
     }
-
-    private sealed class DockerRouteAssembly : IServerRouteAssemblyExtension
-    {
-        public Assembly Assembly => typeof(DockerPlugin).Assembly;
-    }
-
-    private sealed class HostsNavigation : IServerNavigationExtension
-    {
-        public string Id => $"{PluginId}.hosts";
-        public string Label => "Docker Hosts";
-        public string Href => DockerRoutes.Hosts;
-        public string? Icon => "Cube";
-        public string? Section => ServerNavigationSection.Settings;
-        public string? After => "/Settings/Servers";
-    }
 }
 
-/// <summary>The plugin's pages.</summary>
+/// <summary>The server's pages the plugin links to.</summary>
 public static class DockerRoutes
 {
-    public const string Hosts = "/Plugins/Docker/Hosts";
+    /// <summary>Settings › Servers, where the Docker engine's hosts are configured.</summary>
+    public const string Hosts = "/Settings/Servers";
 }

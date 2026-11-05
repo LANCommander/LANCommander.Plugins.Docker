@@ -4,7 +4,6 @@ using LANCommander.Plugins.Docker.Components;
 using LANCommander.Plugins.Docker.Containers;
 using LANCommander.Plugins.Docker.Engine;
 using LANCommander.Plugins.Docker.Hosts;
-using LANCommander.Plugins.Docker.Pages;
 using LANCommander.SDK.Plugins;
 using LANCommander.Server.Plugins;
 using LANCommander.Server.UI.Extensions;
@@ -57,6 +56,28 @@ public sealed class PageTests : BunitContext
 
     private ServerEngineEditorContext Context() => new(() => _server, change => _server = change(_server));
 
+    // What Settings › Servers runs when it's saved
+    private readonly List<Func<CancellationToken, Task>> _onSave = [];
+
+    private IRenderedComponent<DockerEngineSettings> RenderSettings() => Render<DockerEngineSettings>(parameters => parameters
+        .Add(p => p.Context, new ServerEngineSettingsContext(save =>
+        {
+            _onSave.Add(save);
+
+            return new Unregister(() => _onSave.Remove(save));
+        })));
+
+    private async Task SaveSettingsPageAsync(IRenderedComponent<DockerEngineSettings> settings)
+    {
+        foreach (var save in _onSave.ToList())
+            await settings.InvokeAsync(() => save(CancellationToken.None));
+    }
+
+    private sealed class Unregister(Action remove) : IDisposable
+    {
+        public void Dispose() => remove();
+    }
+
     [Fact]
     public void WithoutHostsTheEditorSaysWhereToAddOne()
     {
@@ -67,9 +88,9 @@ public sealed class PageTests : BunitContext
     }
 
     [Fact]
-    public async Task AnAdministratorAddsAHost()
+    public async Task AnAdministratorAddsAHostAndItsSavedWithThePage()
     {
-        var page = Render<HostsPage>();
+        var page = RenderSettings();
 
         await page.FindAll("button").Single(b => b.TextContent.Trim() == "Add Host").ClickAsync(new());
 
@@ -78,10 +99,53 @@ public sealed class PageTests : BunitContext
 
         await page.Find("form").SubmitAsync();
 
+        // Listed, but not saved until the page is
+        Assert.Contains("Not saved", page.Markup);
+        Assert.Empty(_settings.Current.Hosts);
+
+        await SaveSettingsPageAsync(page);
+
         var host = Assert.Single(_settings.Current.Hosts);
 
         Assert.Equal("Local", host.Name);
         Assert.Equal(DockerHost.DefaultAddress, host.Address);
+        Assert.DoesNotContain("Not saved", page.Markup);
+    }
+
+    [Fact]
+    public async Task AWrongCatalogUrlIsntSavedAndNeitherAreTheHosts()
+    {
+        var remote = new DockerHost { Name = "Remote", Address = "tcp://127.0.0.1:1" };
+
+        _settings.Current.Hosts.Add(remote);
+
+        var page = RenderSettings();
+
+        await page.InvokeAsync(() => page.FindComponents<LANCommander.Server.UI.Controls.TextInput>()
+            .Single(i => i.Instance.Placeholder?.StartsWith("None") == true).Instance.ValueChanged.InvokeAsync("ftp://example.com/index.json"));
+
+        // Removing the host, too
+        await page.InvokeAsync(() => page.FindComponent<LANCommander.Server.UI.Controls.Popconfirm>().Instance.OnConfirm.InvokeAsync());
+
+        Assert.DoesNotContain(remote.Address, page.Markup);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => SaveSettingsPageAsync(page));
+
+        Assert.Contains("isn't an http or https address", error.Message);
+        Assert.Equal("", _settings.Current.ImageCatalogUrl);
+        Assert.Single(_settings.Current.Hosts);
+    }
+
+    [Fact]
+    public void ClosingThePanelStopsItBeingSaved()
+    {
+        var page = RenderSettings();
+
+        Assert.Single(_onSave);
+
+        page.Instance.Dispose();
+
+        Assert.Empty(_onSave);
     }
 
     [DockerFact]
@@ -290,7 +354,7 @@ public sealed class PageTests : BunitContext
 
         await Services.GetRequiredService<ContainerService>().CreateAsync(_local.Id, new ContainerDefinition { Name = _name, Image = DockerEngineTests.Image, Command = "sleep 600" });
 
-        var page = Render<HostsPage>();
+        var page = RenderSettings();
 
         page.WaitForAssertion(() => Assert.Contains(_name, page.Markup));
 
@@ -314,9 +378,9 @@ public sealed class PageTests : BunitContext
     }
 
     [Fact]
-    public void WithoutUnusedContainersTheHostsPageSaysSo()
+    public void WithoutUnusedContainersTheEngineSettingsSaySo()
     {
-        var page = Render<HostsPage>();
+        var page = RenderSettings();
 
         page.WaitForAssertion(() => Assert.Contains("Containers no server uses", page.Markup));
         Assert.Contains("None.", page.Markup);
@@ -346,5 +410,8 @@ public sealed class PageTests : BunitContext
         public Task<ServerHttpPathInfo> AddHttpPathAsync(Guid serverId, ServerHttpPathInfo httpPath, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<ServerHttpPathInfo> UpdateHttpPathAsync(ServerHttpPathInfo httpPath, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task DeleteHttpPathAsync(Guid id, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<ServerFileInfo>> ListFilesAsync(Guid serverId, string relativePath, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<Stream> OpenFileAsync(Guid serverId, string relativePath, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task WriteFileAsync(Guid serverId, string relativePath, Stream content, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 }
