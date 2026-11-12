@@ -70,7 +70,7 @@ public sealed class DockerHosts(IPluginSettings<DockerSettings> settings, ILogge
         settings.Update(s =>
         {
             s.Hosts.RemoveAll(h => h.Id == host.Id);
-            s.Hosts.Add(new DockerHost { Id = host.Id, Name = host.Name.Trim(), Address = host.Address.Trim(), DataFolder = host.DataFolder?.Trim() ?? "" });
+            s.Hosts.Add(host.Copy());
         });
     }
 
@@ -83,7 +83,7 @@ public sealed class DockerHosts(IPluginSettings<DockerSettings> settings, ILogge
     public void Replace(IEnumerable<DockerHost> hosts)
     {
         var saved = hosts
-            .Select(host => new DockerHost { Id = host.Id, Name = host.Name?.Trim() ?? "", Address = host.Address?.Trim() ?? "", DataFolder = host.DataFolder?.Trim() ?? "" })
+            .Select(host => host.Copy())
             .ToList();
 
         foreach (var host in saved)

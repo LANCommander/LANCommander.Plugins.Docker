@@ -263,37 +263,91 @@ public sealed class PageTests : BunitContext
             .Add(p => p.Spec, spec)
             .Add(p => p.HostId, Guid.NewGuid()));
 
-        form.WaitForAssertion(() => Assert.Contains("collisions and shared folders aren't checked", form.Markup));
+        form.WaitForAssertion(() => Assert.Contains("Couldn't check for collisions", form.Markup));
 
-        Assert.Contains("DX_PORT=7790", form.Markup);
-        Assert.Contains("host ports don't apply", form.Markup);
-        Assert.Contains("for every server of this game on the host to share", form.Markup);
+        // The image's variables are offered as names to pick, not listed
+        Assert.Contains("Pick a variable the image sets", form.Markup);
+        Assert.DoesNotContain("DX_PORT=7790", form.Markup);
+        Assert.Contains("used directly on the host", form.Markup);
+        Assert.Contains("shared by every server of this game on the host", form.Markup);
+
+        // An official image always gets the privileges its overlay needs
+        Assert.True(spec.CanMountOverlay);
     }
 
-    [Fact]
-    public async Task LogFilesAreKeptWithTheServer()
+    [DockerFact]
+    public async Task LogFilesAreTheImagesAndThoseChosenFromTheContainersFiles()
     {
+        _settings.Current.Hosts.Add(_local);
+
+        var client = Services.GetRequiredService<DockerHosts>().GetClient(_local.Id);
+
+        await client.Containers.CreateContainerAsync(new CreateContainerParameters
+        {
+            Name = _name,
+            Image = DockerEngineTests.Image,
+            Cmd = ["sh", "-c", "mkdir -p /srv/logs && echo started > /srv/logs/server.log && sleep 600"],
+            Labels = new Dictionary<string, string> { [ContainerLogFile.LabelPrefix + "chat"] = "/srv/logs/chat.log" },
+            HostConfig = new HostConfig { Binds = [$"{_name}-logs:/srv/logs"] },
+        });
+        await client.Containers.StartContainerAsync(_name, new ContainerStartParameters());
+
         _server = _server with
         {
             Settings = ServerEngineSettings.Write(new DockerServerSettings
             {
-                HostId = Guid.NewGuid(),
-                ContainerId = "deusex",
-                LogFiles = [new ContainerLogFile { Name = "Server log", Path = "/config/Overlay/System/server.log" }],
+                HostId = _local.Id,
+                ContainerId = _name,
+                LogFiles = [new ContainerLogFile { Name = "Old", Path = "/srv/old.log" }],
             }),
         };
 
         var editor = Render<DockerServerEditor>(parameters => parameters.Add(p => p.Context, Context()));
 
-        Assert.Contains("/config/Overlay/System/server.log", editor.FindAll("input").Select(i => i.GetAttribute("value")));
+        editor.WaitForAssertion(() => Assert.Contains("From the image", editor.Markup));
+        Assert.Contains("/srv/logs/chat.log", editor.Markup);
 
-        await editor.FindAll("button").Single(b => b.TextContent.Trim() == "Add Log File").ClickAsync(new());
+        // The volume is only reached through the container, from the folder it's mounted at
+        Assert.Contains("Only while running", editor.Markup);
+
         await editor.FindAll("button").First(b => b.GetAttribute("title") == "Remove").ClickAsync(new());
+        await editor.FindAll("button").Single(b => b.TextContent.Trim() == "Add Log File").ClickAsync(new());
 
-        // The new one is left, empty
+        editor.WaitForAssertion(() => Assert.Contains("server.log", editor.FindAll("button").Select(b => b.TextContent.Trim())));
+
+        await editor.FindAll("button").Single(b => b.TextContent.Trim() == "server.log").ClickAsync(new());
+
         var file = Assert.Single(_server.GetSettings<DockerServerSettings>().LogFiles);
 
-        Assert.Equal("", file.Path);
+        Assert.Equal("/srv/logs/server.log", file.Path);
+        Assert.Equal("server.log", file.Name);
+    }
+
+    [DockerFact]
+    public async Task AContainerOnTheHostsNetworkOffersThePortsItsImageDeclares()
+    {
+        _settings.Current.Hosts.Add(_local);
+
+        var client = Services.GetRequiredService<DockerHosts>().GetClient(_local.Id);
+
+        await client.Containers.CreateContainerAsync(new CreateContainerParameters
+        {
+            Name = _name,
+            Image = DockerEngineTests.Image,
+            Cmd = ["sleep", "600"],
+            ExposedPorts = new Dictionary<string, EmptyStruct> { ["27960/udp"] = default },
+            HostConfig = new HostConfig { NetworkMode = "host" },
+        });
+
+        _server = _server with { Settings = ServerEngineSettings.Write(new DockerServerSettings { HostId = _local.Id, ContainerId = _name }) };
+
+        var editor = Render<DockerServerEditor>(parameters => parameters.Add(p => p.Context, Context()));
+
+        editor.WaitForAssertion(() => Assert.Contains("host's own network", editor.Markup));
+
+        await editor.FindAll("button").Single(b => b.TextContent.Trim() == "27960/udp").ClickAsync(new());
+
+        Assert.Equal(27960, _server.Port);
     }
 
     [Fact]

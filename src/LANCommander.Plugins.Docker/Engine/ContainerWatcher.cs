@@ -59,6 +59,9 @@ internal sealed class ContainerWatcher : IAsyncDisposable
 
     public bool CanSendInput => _running && _openStdin;
 
+    /// <summary>The log files the container's image names in its labels, as last looked at.</summary>
+    public IReadOnlyList<ContainerLogFile> ImageLogFiles { get; private set; } = [];
+
     /// <summary>Follows another container, or the same one on another host.</summary>
     public void Update(DockerServerSettings settings)
     {
@@ -142,6 +145,7 @@ internal sealed class ContainerWatcher : IAsyncDisposable
                 if (settings.HostId == null || string.IsNullOrWhiteSpace(settings.ContainerId))
                 {
                     _running = false;
+                    ImageLogFiles = [];
                     await WaitAsync(Timeout.InfiniteTimeSpan, cancellation.Token);
                     continue;
                 }
@@ -150,6 +154,7 @@ internal sealed class ContainerWatcher : IAsyncDisposable
                 var container = await client.Containers.InspectContainerAsync(settings.ContainerId, cancellation.Token);
 
                 _containerId = container.ID;
+                ImageLogFiles = ContainerLogFile.FromLabels(container.Config?.Labels);
                 _openStdin = container.Config?.OpenStdin == true;
                 _running = container.State?.Running == true;
 

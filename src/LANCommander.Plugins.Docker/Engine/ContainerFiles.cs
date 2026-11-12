@@ -7,17 +7,45 @@ using LANCommander.Server.Plugins;
 
 namespace LANCommander.Plugins.Docker.Engine;
 
+/// <summary>A folder or volume mounted into a container.</summary>
+/// <param name="Destination">Where it is in the container, e.g. <c>/config</c>.</param>
+/// <param name="Source">The folder on the Docker host, as written when the container was made, or the volume's name.</param>
+/// <param name="IsFolder">Whether it's a folder on the Docker host rather than a volume.</param>
+/// <param name="LocalPath">Where LANCommander finds the folder itself; null if it can't.</param>
+public sealed record MountedFolder(string Destination, string Source, bool IsFolder, string? LocalPath);
+
+/// <summary>Where a server's files are, as its Files page shows them.</summary>
+/// <param name="Root">The folder in the container the Files page starts at.</param>
+public sealed record FilesView(string Root, IReadOnlyList<MountedFolder> Mounts, bool Running);
+
+/// <summary>Where a path in a container is to be found.</summary>
+internal abstract record FileLocation
+{
+    /// <summary>In a folder mounted from the Docker host, which LANCommander reaches at this path.</summary>
+    public sealed record OnHost(string Path) : FileLocation;
+
+    /// <summary>A folder in the container that holds mounts, but isn't in one itself: only those are in it.</summary>
+    public sealed record Between(IReadOnlyList<string> Children) : FileLocation;
+
+    /// <summary>Only in the container, so only reached through it while it runs.</summary>
+    public sealed record InContainer : FileLocation
+    {
+        public static readonly InContainer Instance = new();
+    }
+}
+
 /// <summary>
-/// A server's files, in its container under the folder <see cref="DockerServerSettings.FilesPath"/>
-/// names, or the container's working directory. Each operation is a short <c>docker exec</c> of
-/// <c>sh</c> in the running container, as the container's own user, so files are written with the
-/// owner and permissions the server expects and links are followed as the server would follow them.
+/// A server's files: the folders mounted into its container, from the deepest folder holding them all.
+/// Those in a host folder LANCommander can reach (<see cref="HostFolders"/>) are managed there
+/// directly, running or not. The rest are managed through the container, while it runs, with a short
+/// <c>docker exec</c> of <c>sh</c> as the container's own user.
 /// </summary>
 /// <remarks>
-/// Paths arrive checked by the server: relative, "/" between folders, no "..". They aren't confined
-/// any further; the container's Shell console reaches everything anyway.
+/// Paths arrive checked by the server: relative, "/" between folders, no "..". On the host, links are
+/// followed only as far as they stay in the mounted folder; in the container they aren't confined
+/// any further, as the container's Shell console reaches everything anyway.
 /// </remarks>
-internal sealed class ContainerFiles(DockerHosts hosts)
+public sealed class ContainerFiles(DockerHosts hosts)
 {
     // Exit codes the scripts below use to say what went wrong, beside the shell's own 126 and 127
     private const int NotFound = 2;
@@ -64,10 +92,20 @@ internal sealed class ContainerFiles(DockerHosts hosts)
 
     public async Task<IReadOnlyList<ServerEngineFile>> ListAsync(DockerServerSettings settings, string path, CancellationToken cancellationToken)
     {
-        var (client, container, root) = await ResolveAsync(settings, cancellationToken);
-        var target = InContainer(root, path);
+        var view = await ResolveAsync(settings, cancellationToken);
+        var target = InContainer(view.Root, path);
 
-        var (output, error, exitCode) = await RunAsync(client, container, ListScript, [target], null, cancellationToken);
+        switch (Locate(target, view.Mounts))
+        {
+            case FileLocation.OnHost(var local):
+                return ListLocal(local, target, ChildMountsOf(target, view.Mounts));
+
+            case FileLocation.Between(var children):
+                return children.Select(name => new ServerEngineFile(name, true, null, null)).ToList();
+        }
+
+        var client = view.RequireRunning();
+        var (output, error, exitCode) = await RunAsync(client, view.Container, ListScript, [target], null, cancellationToken);
 
         ThrowIfFailed(exitCode, error, target, directory: true);
 
@@ -76,10 +114,26 @@ internal sealed class ContainerFiles(DockerHosts hosts)
 
     public async Task<Stream> OpenAsync(DockerServerSettings settings, string path, CancellationToken cancellationToken)
     {
-        var (client, container, root) = await ResolveAsync(settings, cancellationToken);
-        var target = InContainer(root, path);
+        var view = await ResolveAsync(settings, cancellationToken);
+        var target = InContainer(view.Root, path);
 
-        var (execId, stream) = await StartAsync(client, container, ReadScript, [target], stdin: false, cancellationToken);
+        switch (Locate(target, view.Mounts))
+        {
+            case FileLocation.OnHost(var local):
+                if (Directory.Exists(local))
+                    throw new IOException($"{target}: It is a folder.");
+
+                if (!File.Exists(local))
+                    throw new FileNotFoundException($"There is no file {target} in the container.", target);
+
+                return new FileStream(local, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 81920, FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+            case FileLocation.Between:
+                throw new IOException($"{target}: It is a folder.");
+        }
+
+        var client = view.RequireRunning();
+        var (execId, stream) = await StartAsync(client, view.Container, ReadScript, [target], stdin: false, cancellationToken);
         var reader = new ExecOutputStream(client, execId, stream, (exitCode, error) => ThrowIfFailed(exitCode, error, target, directory: false));
 
         try
@@ -99,15 +153,35 @@ internal sealed class ContainerFiles(DockerHosts hosts)
 
     public async Task WriteAsync(DockerServerSettings settings, string path, Stream content, CancellationToken cancellationToken)
     {
-        var (client, container, root) = await ResolveAsync(settings, cancellationToken);
-        var target = InContainer(root, path);
+        var view = await ResolveAsync(settings, cancellationToken);
+        var target = InContainer(view.Root, path);
+
+        switch (Locate(target, view.Mounts))
+        {
+            case FileLocation.OnHost(var local):
+                if (Directory.Exists(local))
+                    throw new IOException($"{target}: It is a folder.");
+
+                Directory.CreateDirectory(Path.GetDirectoryName(local)!);
+
+                // Truncated in place rather than replaced, so an existing file keeps its owner and mode
+                await using (var file = new FileStream(local, FileMode.Create, FileAccess.Write, FileShare.None, 81920, FileOptions.Asynchronous))
+                    await content.CopyToAsync(file, cancellationToken);
+
+                return;
+
+            case FileLocation.Between:
+                throw NotInAMount(target);
+        }
+
+        var client = view.RequireRunning();
 
         // Its length is passed with it, so a stream that can't tell it is kept on disk first
         await using var buffered = content.CanSeek ? null : await BufferAsync(content, cancellationToken);
         var input = buffered ?? content;
         var length = input.Length - input.Position;
 
-        var (_, error, exitCode) = await RunAsync(client, container, WriteScript, [target, length.ToString(CultureInfo.InvariantCulture)], input, cancellationToken);
+        var (_, error, exitCode) = await RunAsync(client, view.Container, WriteScript, [target, length.ToString(CultureInfo.InvariantCulture)], input, cancellationToken);
 
         ThrowIfFailed(exitCode, error, target, directory: false);
     }
@@ -135,46 +209,203 @@ internal sealed class ContainerFiles(DockerHosts hosts)
 
     public async Task DeleteAsync(DockerServerSettings settings, string path, CancellationToken cancellationToken)
     {
-        var (client, container, root) = await ResolveAsync(settings, cancellationToken);
-        var target = InContainer(root, path);
+        var view = await ResolveAsync(settings, cancellationToken);
+        var target = InContainer(view.Root, path);
 
-        if (target == root)
+        if (target == view.Root)
             throw new InvalidOperationException("The server's files folder itself can't be deleted.");
 
-        var (_, error, exitCode) = await RunAsync(client, container, DeleteScript, [target], null, cancellationToken);
+        // A mounted folder is the host's or a volume, not something in the container to delete
+        if (view.Mounts.Any(m => IsUnder(m.Destination, target)))
+            throw new InvalidOperationException($"{target} is, or holds, a folder mounted into the container, so it can't be deleted.");
+
+        switch (Locate(target, view.Mounts))
+        {
+            case FileLocation.OnHost(var local):
+                // A link is removed, not what it links to
+                var entry = new FileInfo(local);
+
+                if (entry.LinkTarget == null && Directory.Exists(local))
+                    Directory.Delete(local, recursive: true);
+                else if (entry.Exists || entry.LinkTarget != null)
+                    entry.Delete();
+                else
+                    throw new FileNotFoundException($"There is no file or folder {target} in the container.", target);
+
+                return;
+
+            case FileLocation.Between:
+                throw NotInAMount(target);
+        }
+
+        var client = view.RequireRunning();
+        var (_, error, exitCode) = await RunAsync(client, view.Container, DeleteScript, [target], null, cancellationToken);
 
         ThrowIfFailed(exitCode, error, target, directory: false);
     }
 
     public async Task CreateDirectoryAsync(DockerServerSettings settings, string path, CancellationToken cancellationToken)
     {
-        var (client, container, root) = await ResolveAsync(settings, cancellationToken);
-        var target = InContainer(root, path);
+        var view = await ResolveAsync(settings, cancellationToken);
+        var target = InContainer(view.Root, path);
 
-        var (_, error, exitCode) = await RunAsync(client, container, CreateDirectoryScript, [target], null, cancellationToken);
+        switch (Locate(target, view.Mounts))
+        {
+            case FileLocation.OnHost(var local):
+                Directory.CreateDirectory(local);
+                return;
+
+            case FileLocation.Between:
+                throw NotInAMount(target);
+        }
+
+        var client = view.RequireRunning();
+        var (_, error, exitCode) = await RunAsync(client, view.Container, CreateDirectoryScript, [target], null, cancellationToken);
 
         ThrowIfFailed(exitCode, error, target, directory: true);
     }
 
-    /// <summary>
-    /// The folder in the container the server's files are under: the one the server's settings name,
-    /// or the container's working directory, or its root.
-    /// </summary>
-    internal static string RootOf(DockerServerSettings settings, string? workingDirectory)
+    /// <summary>Where the server's files are, for showing where they're managed from.</summary>
+    public async Task<FilesView> DescribeAsync(DockerServerSettings settings, CancellationToken cancellationToken)
     {
-        var root = !string.IsNullOrWhiteSpace(settings.FilesPath) ? settings.FilesPath.Trim() : workingDirectory;
+        var view = await ResolveAsync(settings, cancellationToken);
 
-        if (string.IsNullOrWhiteSpace(root))
+        return new FilesView(view.Root, view.Mounts, view.Running);
+    }
+
+    private static IOException NotInAMount(string target) =>
+        new($"{target} isn't in a folder mounted into the container, so nothing can be put there.");
+
+    /// <summary>
+    /// The folder in the container the server's files are under: the deepest folder that holds every
+    /// folder mounted into it, so the server's own files are shown rather than the image's. Without
+    /// mounts, the container's working directory, or its root.
+    /// </summary>
+    internal static string RootOf(IReadOnlyList<MountedFolder> mounts, string? workingDirectory)
+    {
+        if (mounts.Count == 0)
+            return Normalize(workingDirectory);
+
+        var common = mounts[0].Destination.Split('/', StringSplitOptions.RemoveEmptyEntries).ToList();
+
+        foreach (var mount in mounts.Skip(1))
+        {
+            var segments = mount.Destination.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            var same = 0;
+
+            while (same < common.Count && same < segments.Length && common[same] == segments[same])
+                same++;
+
+            common.RemoveRange(same, common.Count - same);
+        }
+
+        return "/" + string.Join('/', common);
+    }
+
+    /// <summary>A folder in the container as a path from its root, without a trailing "/".</summary>
+    internal static string Normalize(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
             return "/";
 
-        root = root.Replace('\\', '/');
+        var normalized = path.Trim().Replace('\\', '/');
 
-        if (!root.StartsWith('/'))
-            root = "/" + root;
+        if (!normalized.StartsWith('/'))
+            normalized = "/" + normalized;
 
-        root = root.TrimEnd('/');
+        normalized = normalized.TrimEnd('/');
 
-        return root.Length == 0 ? "/" : root;
+        return normalized.Length == 0 ? "/" : normalized;
+    }
+
+    /// <summary>Whether <paramref name="path"/> is <paramref name="folder"/> or inside it.</summary>
+    internal static bool IsUnder(string path, string folder) =>
+        folder == "/" || path == folder || path.StartsWith(folder + "/", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Where a path in the container is to be found: in a mounted folder LANCommander can reach, in
+    /// the folders leading to mounts, or only in the container.
+    /// </summary>
+    /// <exception cref="UnauthorizedAccessException">A link on the host leads out of its mounted folder.</exception>
+    internal static FileLocation Locate(string target, IReadOnlyList<MountedFolder> mounts)
+    {
+        var mount = mounts
+            .Where(m => IsUnder(target, m.Destination))
+            .MaxBy(m => m.Destination.Length);
+
+        if (mount != null)
+        {
+            if (mount.LocalPath == null)
+                return FileLocation.InContainer.Instance;
+
+            string[] relative = target.Length > mount.Destination.Length
+                ? target[(mount.Destination == "/" ? 1 : mount.Destination.Length + 1)..].Split('/')
+                : [];
+
+            return new FileLocation.OnHost(HostFolders.Confine(mount.LocalPath, relative));
+        }
+
+        var children = ChildMountsOf(target, mounts);
+
+        return children.Count > 0 ? new FileLocation.Between(children) : FileLocation.InContainer.Instance;
+    }
+
+    /// <summary>The names in a folder that lead to mounts below it.</summary>
+    internal static IReadOnlyList<string> ChildMountsOf(string folder, IReadOnlyList<MountedFolder> mounts) =>
+        mounts
+            .Where(m => m.Destination != folder && IsUnder(m.Destination, folder))
+            .Select(m => m.Destination[(folder == "/" ? 1 : folder.Length + 1)..].Split('/')[0])
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+    /// <summary>A folder on the host, with the folders of any mounts below it, which may not be there yet.</summary>
+    internal static IReadOnlyList<ServerEngineFile> ListLocal(string local, string target, IReadOnlyList<string> mountedBelow)
+    {
+        var folder = new DirectoryInfo(local);
+
+        if (!folder.Exists)
+        {
+            if (File.Exists(local))
+                throw new IOException($"{target}: It isn't a folder.");
+
+            throw new DirectoryNotFoundException($"There is no folder {target} in the container.");
+        }
+
+        var files = new List<ServerEngineFile>();
+
+        foreach (var entry in folder.EnumerateFileSystemInfos("*", new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = 0 }))
+        {
+            // As the container would show it, with links followed; a broken one is left out, as there
+            var isDirectory = Directory.Exists(entry.FullName);
+
+            if (!isDirectory && !File.Exists(entry.FullName))
+                continue;
+
+            long? size = isDirectory ? null : LengthOf(entry.FullName);
+
+            files.Add(new ServerEngineFile(entry.Name, isDirectory, size, entry.LastWriteTimeUtc));
+        }
+
+        foreach (var name in mountedBelow.Where(name => files.All(f => f.Name != name)))
+            files.Add(new ServerEngineFile(name, true, null, null));
+
+        return files;
+    }
+
+    // A link's own length isn't its file's
+    private static long? LengthOf(string path)
+    {
+        try
+        {
+            var file = new FileInfo(path);
+
+            return file.LinkTarget != null && file.ResolveLinkTarget(returnFinalTarget: true) is FileInfo target ? target.Length : file.Length;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
     }
 
     /// <summary>A path among the server's files as the container names it.</summary>
@@ -183,6 +414,8 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         // The server never sends these; this is the last place they could do harm
         if (path.StartsWith('/') || path.Split('/').Any(segment => segment is ".."))
             throw new ArgumentException("The path can't leave the server's files.", nameof(path));
+
+        path = path.TrimEnd('/');
 
         return path.Length == 0 ? root
             : root == "/" ? "/" + path
@@ -244,12 +477,13 @@ internal sealed class ContainerFiles(DockerHosts hosts)
         }
     }
 
-    private async Task<(DockerClient Client, string Container, string Root)> ResolveAsync(DockerServerSettings settings, CancellationToken cancellationToken)
+    private async Task<ResolvedView> ResolveAsync(DockerServerSettings settings, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(settings.ContainerId))
             throw new DockerHostException("No container has been chosen for this server. Choose one on its General page.");
 
         var client = hosts.GetClient(settings.HostId);
+        var host = hosts.Find(settings.HostId)!;
 
         ContainerInspectResponse container;
 
@@ -262,11 +496,79 @@ internal sealed class ContainerFiles(DockerHosts hosts)
             throw new DockerHostException($"The container \"{settings.ContainerId}\" doesn't exist on its Docker host.");
         }
 
-        // Docker can only run commands in a running container
-        if (container.State is not { Running: true })
-            throw new DockerHostException("The container isn't running. Start the server to manage its files.");
+        var mounts = MountsOf(container, host);
 
-        return (client, container.ID, RootOf(settings, container.Config?.WorkingDir));
+        return new ResolvedView(client, container.ID, container.State is { Running: true }, RootOf(mounts, container.Config?.WorkingDir), mounts);
+    }
+
+    /// <summary>The folders and volumes mounted into the container, with where LANCommander finds each of the host's folders.</summary>
+    internal static IReadOnlyList<MountedFolder> MountsOf(ContainerInspectResponse container, DockerHost host)
+    {
+        var written = WrittenSources(container.HostConfig?.Binds);
+
+        return (container.Mounts ?? [])
+            .Where(m => m.Type is "bind" or "volume" && !string.IsNullOrWhiteSpace(m.Destination))
+            .Select(m =>
+            {
+                var destination = Normalize(m.Destination);
+                var isFolder = m.Type == "bind";
+                var source = (isFolder && written.TryGetValue(destination, out var asWritten) ? asWritten : isFolder ? m.Source : m.Name) ?? "";
+
+                string? local = null;
+
+                if (isFolder && source.Length > 0)
+                {
+                    try
+                    {
+                        local = HostFolders.LocalPathOf(host, source);
+                    }
+                    catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+                    {
+                        // A link leads out of the data folder: left to the container, which sees it as it is
+                    }
+                }
+
+                return new MountedFolder(destination, source, isFolder, local);
+            })
+            .DistinctBy(m => m.Destination)
+            .OrderBy(m => m.Destination, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    /// <summary>
+    /// The sources of the container's binds as they were written, by where they're mounted. Docker
+    /// Desktop reports a Windows folder's mount at a path in its own machine instead.
+    /// </summary>
+    internal static IReadOnlyDictionary<string, string> WrittenSources(IEnumerable<string>? binds)
+    {
+        var sources = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var bind in binds ?? [])
+        {
+            // The destination is a Linux path, after the last ":/"; a Windows source has a ":" of its own
+            var separator = bind.LastIndexOf(":/", StringComparison.Ordinal);
+
+            if (separator <= 0)
+                continue;
+
+            var rest = bind[(separator + 1)..];
+            var options = rest.IndexOf(':');
+
+            sources.TryAdd(Normalize(options < 0 ? rest : rest[..options]), bind[..separator]);
+        }
+
+        return sources;
+    }
+
+    /// <summary>A container, as far as its files are concerned.</summary>
+    private sealed record ResolvedView(DockerClient Client, string Container, bool Running, string Root, IReadOnlyList<MountedFolder> Mounts)
+    {
+        // Docker can only run commands in a running container
+        public DockerClient RequireRunning() => Running
+            ? Client
+            : throw new DockerHostException(Mounts.Any(m => m.IsFolder)
+                ? "The container isn't running, and LANCommander can't reach these files on the Docker host. Start the server to manage them, or set where LANCommander finds the host's data folder under Settings → Servers."
+                : "The container isn't running. Start the server to manage its files.");
     }
 
     private static async Task<(string Output, string Error, long ExitCode)> RunAsync(DockerClient client, string container, string script, string[] arguments, Stream? input, CancellationToken cancellationToken)

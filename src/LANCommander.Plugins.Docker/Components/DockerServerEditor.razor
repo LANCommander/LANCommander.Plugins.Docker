@@ -33,10 +33,6 @@
     </FormItem>
 </div>
 
-<FormItem Label="Files folder" Class="edit-form-mono" Help="The folder in the container the server's Files page shows, such as its data volume. Empty for the container's working directory.">
-    <TextInput Value="@Settings.FilesPath" ValueChanged="SetFilesPath" Disabled="string.IsNullOrWhiteSpace(Settings.ContainerId)" Placeholder="@(String.IsNullOrWhiteSpace(_workingDirectory) ? "/" : _workingDirectory)" />
-</FormItem>
-
 <FormItem Label="Log files" Class="edit-form-mono" Help="Log files the server writes in its container, each shown as a console under its Monitor. While the server runs they're followed as they're written; while it's stopped, the end of each is shown as it was left, which only works for files on disk: with LANCommander's server images, under /config/Overlay rather than /config/Merged.">
     <Flex Vertical Gap="Gap.Small">
         @{ var logFiles = Settings.LogFiles; }
@@ -171,7 +167,6 @@
 
     IReadOnlyList<ContainerSummary> _containers = [];
     ContainerDefinition? _container;
-    string? _workingDirectory;
     string? _state;
     string? _status;
     string? _error;
@@ -238,14 +233,6 @@
         await LoadContainerAsync();
     }
 
-    void SetFilesPath(string? path)
-    {
-        var settings = Settings;
-
-        settings.FilesPath = string.IsNullOrWhiteSpace(path) ? null : path.Trim();
-        Context.SetSettings(settings);
-    }
-
     // The settings are read afresh each time, so a log file is found again by where it is in the list
     void ChangeLogFiles(Action<List<ContainerLogFile>> change)
     {
@@ -302,7 +289,6 @@
     async Task LoadContainerAsync()
     {
         _container = null;
-        _workingDirectory = null;
 
         if (Settings.HostId is not { } hostId || string.IsNullOrWhiteSpace(Settings.ContainerId))
             return;
@@ -318,7 +304,6 @@
             }
 
             _container = ContainerDefinition.From(inspected);
-            _workingDirectory = inspected.Config?.WorkingDir;
             _state = inspected.State?.Status;
             _status = inspected.State?.Status switch
             {
@@ -464,10 +449,6 @@
 
             await LoadContainersAsync();
             await SetContainerAsync(name);
-
-            // A server image's files are browsed as the server sees them, with changes kept in its overlay
-            if (ContainerDefinition.IsServerImage(draft.Image) && Settings.FilesPath == null)
-                SetFilesPath("/config/Merged");
 
             if (Context.Server.Port == 0 && FirstPlayerPort(draft) is { } address)
                 Context.SetAddress(address.Host, address.Port);

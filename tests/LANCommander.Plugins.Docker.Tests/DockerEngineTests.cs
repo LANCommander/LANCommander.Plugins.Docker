@@ -55,7 +55,7 @@ public sealed class DockerEngineTests : IAsyncLifetime
 
         _hosts = TestHosts.Create(_host);
         _containers = new ContainerService(_hosts, NullLogger<ContainerService>.Instance);
-        _engine = new DockerServerEngine(_hosts, new ConfigurationBuilder().Build(), NullLogger<DockerServerEngine>.Instance);
+        _engine = new DockerServerEngine(_hosts, new ContainerFiles(_hosts), new ConfigurationBuilder().Build(), NullLogger<DockerServerEngine>.Instance);
     }
 
     public Task InitializeAsync() => _engine.InitializeAsync(_engineHost, CancellationToken.None);
@@ -689,11 +689,17 @@ public sealed class DockerEngineTests : IAsyncLifetime
     [DockerFact]
     public async Task AServersFilesAreWrittenListedReadAndDeletedInItsContainer()
     {
-        var server = await AddServerAsync("sleep 600");
-
+        // A volume, which LANCommander can't reach on the host, so it's managed through the container;
+        // the Files page starts at the folder it's mounted at
+        await _containers.CreateAsync(_host.Id, new ContainerDefinition { Name = _name, Image = Image, Command = "sleep 600", Mounts = [new VolumeMount { Source = _name + "-game", Destination = "/srv/game" }] });
         await _hosts.GetClient(_host.Id).Containers.StartContainerAsync(_name, new ContainerStartParameters());
 
-        server = server with { Settings = ServerEngineSettings.Write(new DockerServerSettings { HostId = _host.Id, ContainerId = _name, FilesPath = "/srv/game" }) };
+        var server = new ServerEngineServer
+        {
+            Id = Guid.NewGuid(),
+            Name = _name,
+            Settings = ServerEngineSettings.Write(new DockerServerSettings { HostId = _host.Id, ContainerId = _name }),
+        };
 
         // Folders it is in are made
         await _engine.WriteFileAsync(server, "cfg/server.cfg", new MemoryStream("hostname \"LAN\"\n"u8.ToArray()), CancellationToken.None);

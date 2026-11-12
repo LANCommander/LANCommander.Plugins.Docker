@@ -10,22 +10,29 @@
     <FormItem Label="Name" Class="edit-form-mono">
         <TextInput @bind-Value="Spec.Name" />
     </FormItem>
-    <FormItem Label="Image" Class="edit-form-mono" Help="@ImageHelp">
-        <TextInput @bind-Value="Spec.Image" Disabled="ImageFixed" />
+    <FormItem Label="Image" Class="edit-form-mono" Help="@(ImageFixed ? null : "Pulled if missing. Use Update Image for newer versions.")">
+        <TextInput @bind-Value="Spec.Image" @bind-Value:after="ImageChanged" Disabled="ImageFixed" />
     </FormItem>
 </div>
 
-<FormItem Label="Command" Class="edit-form-mono" Help="Arguments for the image's entry point. Leave empty to use the image's own.">
+<FormItem Label="Command" Class="edit-form-mono" Help="Leave empty for the image's default.">
     <TextInput @bind-Value="Spec.Command" Placeholder="@Spec.Defaults?.Command" />
 </FormItem>
 
 <div class="edit-form-pair">
-    <FormItem Label="Run as" Class="edit-form-mono" Help="The user the image's entry point runs as. LANCommander's server images start as root and switch to their own user for the server.">
+    <FormItem Label="Run as" Class="edit-form-mono">
         <TextInput @bind-Value="Spec.User" Placeholder="@(Spec.Defaults is { User: { Length: > 0 } user } ? user : "The image's user")" />
     </FormItem>
     <FormItem Label="Privileges">
         <Flex Vertical Gap="Gap.Small">
-            <Checkbox @bind-Value="Spec.CanMountOverlay">Allow mounting file systems (SYS_ADMIN, AppArmor unconfined), as LANCommander's server images need for their overlay</Checkbox>
+            <HelpButton>
+                <Description>
+                    Adds <Typography Code>SYS_ADMIN</Typography> and disables AppArmor so the container can mount file systems. LANCommander's server images need this for their overlay.
+                </Description>
+                <ChildContent>
+                    <Checkbox @bind-Value="Spec.CanMountOverlay">Allow mounting file systems</Checkbox>
+                </ChildContent>
+            </HelpButton>
             @if (string.Join(", ", Spec.OtherPrivileges) is { Length: > 0 } others)
             {
                 <Typography Secondary Small>Also kept: <Typography Code>@others</Typography></Typography>
@@ -35,13 +42,13 @@
 </div>
 
 <div class="edit-form-pair">
-    <FormItem Label="Restart policy" Help="What Docker does when the container exits. LANCommander's own autostart works with any of these.">
+    <FormItem Label="Restart policy">
         <Select TValue="string" Items="RestartItems" @bind-Value="Spec.RestartPolicy" />
     </FormItem>
     <FormItem Label="Console">
         <Flex Vertical Gap="Gap.Small">
-            <Checkbox @bind-Value="Spec.Interactive">Keep standard input open, so commands can be sent from the Monitor</Checkbox>
-            <Checkbox @bind-Value="Spec.Terminal">Give the container a terminal</Checkbox>
+            <Checkbox @bind-Value="Spec.Interactive">Enable standard input (used by the Monitor)</Checkbox>
+            <Checkbox @bind-Value="Spec.Terminal">Allocate a terminal</Checkbox>
         </Flex>
     </FormItem>
 </div>
@@ -54,7 +61,7 @@
     </FormItem>
     @if (kind == NetworkKind.OwnAddress || !string.IsNullOrWhiteSpace(Spec.IPAddress))
     {
-        <FormItem Label="Address" Class="edit-form-mono" Help="A fixed address on the network, so players always find the server at it. Leave empty for one the network assigns.">
+        <FormItem Label="Address" Class="edit-form-mono">
             <TextInput @bind-Value="Spec.IPAddress" Placeholder="Assigned by the network" />
         </FormItem>
     }
@@ -68,8 +75,8 @@
 
             <Alert Warning Title="These ports may collide">
                 @(kind == NetworkKind.Host
-                    ? "With host networking the server listens on the host's own ports, which other servers on this host also take. Only one of them can run at a time, or change the ports the server listens on in its settings."
-                    : "Other containers on this host publish the same host ports. Only one of them can run at a time unless the host ports are changed.")
+                    ? "Other servers on this host use these ports. Only one can run at a time."
+                    : "Other containers publish the same host ports. Only one can run at a time.")
                 @if (offset is > 0)
                 {
                     <div>
@@ -81,14 +88,27 @@
 
         @foreach (var port in Spec.Ports)
         {
-            <Flex Gap="Gap.Small" Align="Align.Center">
-                <NumberInput TValue="int?" @bind-Value="port.HostPort" Min="1" Max="65535" Placeholder="Host port" Disabled="kind is NetworkKind.Host or NetworkKind.OwnAddress" />
-                <span aria-hidden="true">→</span>
-                <NumberInput TValue="int" @bind-Value="port.ContainerPort" Min="1" Max="65535" />
-                <Select TValue="string" Items="ProtocolItems" @bind-Value="port.Protocol" />
-                <TextInput @bind-Value="port.HostIp" Placeholder="Every address" Disabled="kind is NetworkKind.Host or NetworkKind.OwnAddress" />
-                <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => Spec.Ports.Remove(port)" />
-            </Flex>
+            @if (kind is NetworkKind.Host or NetworkKind.OwnAddress)
+            {
+                @* Nothing is published: the server's own ports are where players reach it *@
+                <Flex Gap="Gap.Small" Align="Align.Center">
+                    <NumberInput TValue="int" @bind-Value="port.ContainerPort" Min="1" Max="65535" />
+                    <Select TValue="string" Items="ProtocolItems" @bind-Value="port.Protocol" />
+                    <Typography Secondary Small>@(kind == NetworkKind.Host ? "on the host" : "at its own address")</Typography>
+                    <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => Spec.Ports.Remove(port)" />
+                </Flex>
+            }
+            else
+            {
+                <Flex Gap="Gap.Small" Align="Align.Center">
+                    <NumberInput TValue="int?" @bind-Value="port.HostPort" Min="1" Max="65535" Placeholder="Not published" />
+                    <span aria-hidden="true">→</span>
+                    <NumberInput TValue="int" @bind-Value="port.ContainerPort" Min="1" Max="65535" />
+                    <Select TValue="string" Items="ProtocolItems" @bind-Value="port.Protocol" />
+                    <TextInput @bind-Value="port.HostIp" Placeholder="Every address" />
+                    <Button Text Danger Icon="IconType.X" title="Remove" OnClick="() => Spec.Ports.Remove(port)" />
+                </Flex>
+            }
 
             @if (conflicts.FirstOrDefault(c => ReferenceEquals(c.Port, port)) is { } conflict)
             {
@@ -99,35 +119,24 @@
 
         @if (_usesError != null)
         {
-            <Typography Secondary Small>Other containers could not be read, so collisions and shared folders aren't checked: @_usesError</Typography>
+            <Typography Secondary Small>Couldn't check for collisions: @_usesError</Typography>
         }
     </Flex>
 </FormItem>
 
-<FormItem Label="Environment" Help="@(Spec.Defaults == null ? "Includes the variables the image sets: the image the container was created from is no longer on the host, so they can't be told apart." : "The variables this container sets. The image's own are used for the rest, and follow the image when it's updated.")">
+<FormItem Label="Environment" Class="edit-form-mono" Help="@EnvironmentHelp">
     <Flex Vertical Gap="Gap.Small">
+        @{ var imageNames = ImageVariables().Select(v => v.Name).ToList(); }
         @foreach (var variable in Spec.Environment)
         {
             <Flex Gap="Gap.Small" Align="Align.Center">
-                <TextInput @bind-Value="variable.Name" Placeholder="NAME" />
+                <AutoComplete @bind-Value="variable.Name" Options="imageNames" Placeholder="NAME" Style="flex: 2 1 0; min-width: 0" />
                 <span aria-hidden="true">=</span>
-                <TextInput @bind-Value="variable.Value" Placeholder="@DefaultOf(variable.Name)" />
+                <TextInput @bind-Value="variable.Value" Placeholder="@DefaultOf(variable.Name)" Style="flex: 3 1 0; min-width: 0" />
                 <Button Text Danger Icon="IconType.X" title="@(DefaultOf(variable.Name) != null ? "Use the image's" : "Remove")" OnClick="() => Spec.Environment.Remove(variable)" />
             </Flex>
         }
         <Button Icon="IconType.Plus" OnClick="() => Spec.Environment.Add(new EnvironmentVariable())">Add Variable</Button>
-
-        @if (ImageVariables() is { Count: > 0 } defaults)
-        {
-            <Typography Secondary Small>From the image</Typography>
-            @foreach (var variable in defaults)
-            {
-                <Flex Gap="Gap.Small" Align="Align.Center">
-                    <Typography Code>@variable.Name=@variable.Value</Typography>
-                    <Button Small Text title="Set it for this container" OnClick="() => Spec.Environment.Add(new EnvironmentVariable { Name = variable.Name, Value = variable.Value })">Change</Button>
-                </Flex>
-            }
-        }
     </Flex>
 </FormItem>
 
@@ -149,24 +158,24 @@
             @if (isBase && sharers.Count > 0)
             {
                 <Typography Secondary Small>
-                    The game's files, shared with @Names(sharers). Each server lays its own overlay over them, so its configuration and other changes stay its own.
+                    Game files, shared with @Names(sharers).
                     @if (sharers.Any(s => s.Running))
                     {
-                        <Typography Warning Small> A server that installs or updates the game when it starts, such as with STEAM_APP_UPDATE, changes these files under the running ones. Use Update Game Files on the Container page, which stops them all first.</Typography>
+                        <Typography Warning Small> To update them, use Update Game Files on the Container page, which stops these servers first.</Typography>
                     }
                 </Typography>
             }
             else if (isBase && IsGameImage)
             {
-                <Typography Secondary Small>The game's files, for every server of this game on the host to share. Each lays its own overlay over them; the first to start installs the game here.</Typography>
+                <Typography Secondary Small>Game files, shared by every server of this game on the host.</Typography>
             }
             else if (sharers.Count > 0 && mount.Destination.Trim().TrimEnd('/') == ContainerDefinition.ConfigFolder && ContainerDefinition.IsServerImage(Spec.Image))
             {
-                <Typography Danger Small>Also the own files of @Names(sharers). A server clears and mounts its overlay here when it starts, so these servers can't run at the same time; give each its own folder, and share the game's files through @ContainerDefinition.BaseFolder instead.</Typography>
+                <Typography Danger Small>Also used by @Names(sharers). Servers can't share @ContainerDefinition.ConfigFolder; give each its own folder.</Typography>
             }
             else if (sharers.Count > 0)
             {
-                <Typography Warning Small>Also mounted by @Names(sharers). Servers writing the same files can overwrite each other's.</Typography>
+                <Typography Warning Small>Also mounted by @Names(sharers).</Typography>
             }
         }
         <Button Icon="IconType.Plus" OnClick="() => Spec.Mounts.Add(new VolumeMount())">Add Volume</Button>
@@ -190,20 +199,21 @@
     IReadOnlyList<NetworkSummary> _networks = [];
     HostUsage _usage = HostUsage.Empty;
     string? _usesError;
+    ContainerDefinition? _checkedSpec;
 
     bool IsGameImage => ContainerDefinition.SharesGameFiles(Spec.Image);
 
     string VolumesHelp => ContainerDefinition.IsServerImage(Spec.Image)
-        ? $"A folder on the Docker host, or a volume's name, and where it appears in the container. {ContainerDefinition.ConfigFolder} holds the server's own files: its overlay, scripts and settings. {ContainerDefinition.BaseFolder} holds the game's, which servers of the same game can share."
-        : "A folder on the Docker host, or a volume's name, and where it appears in the container. Volumes Docker made without a name are listed by their id, so a replaced container keeps them.";
+        ? $"Host folder or volume → path in the container. {ContainerDefinition.ConfigFolder} holds this server's files; {ContainerDefinition.BaseFolder} the game's, shared between servers."
+        : "Host folder or volume → path in the container.";
+
+    string? EnvironmentHelp => Spec.Defaults == null
+        ? "Includes the image's own variables, as the image is no longer on the host."
+        : ImageVariables().Count > 0 ? "Pick a variable the image sets, or type a new one." : null;
 
     static string Names(IEnumerable<MountUse> uses) =>
         string.Join(", ", uses.Select(u => u.Running ? u.Container : $"{u.Container} (stopped)").Distinct());
     (Guid HostId, string? Container)? _loadedFor;
-
-    string ImageHelp => ImageFixed
-        ? "Chosen when the image was read."
-        : "Pulled if the host doesn't have it. A newer image under the same tag is only used once pulled: use Update Image.";
 
     NetworkKind Kind => PortConflicts.KindOf(Spec.Network, _networks.GroupBy(n => n.Name).ToDictionary(g => g.Key, g => g.First().Driver));
 
@@ -226,27 +236,40 @@
 
     static string NetworkHelp(NetworkKind kind) => kind switch
     {
-        NetworkKind.Host => "The host's own network: the server listens on the host's ports directly, and is seen by LAN browsers that broadcast.",
-        NetworkKind.OwnAddress => "An address of its own on the LAN, so it can't collide with other servers' ports and is seen by LAN browsers that broadcast. Players connect to its address, not the Docker host's.",
-        NetworkKind.None => "No network of its own.",
-        _ => "Behind Docker's NAT: players reach the server on the host ports it publishes. Games that find servers by LAN broadcast won't see it; use host or a macvlan network for those.",
+        NetworkKind.Host => "Uses the host's ports directly. Visible to LAN browsers.",
+        NetworkKind.OwnAddress => "Its own address on the LAN. Visible to LAN browsers.",
+        NetworkKind.None => "No networking.",
+        _ => "Behind NAT on published ports. Not visible to LAN browsers.",
     };
 
     static string PortsHelp(NetworkKind kind) => kind switch
     {
-        NetworkKind.Host => "The ports the server listens on. With host networking they are the host's own, so host ports don't apply. Collisions with other containers are checked; programs running on the host itself aren't.",
-        NetworkKind.OwnAddress => "The ports the server listens on, at the container's own address. Nothing is published on the Docker host, so they can't collide.",
-        _ => "Ports the container listens on, and the host ports players reach them on. Leave the host port empty to not publish one. Collisions with other containers are checked; programs running on the host itself aren't.",
+        NetworkKind.Host => "The server's ports, used directly on the host.",
+        NetworkKind.OwnAddress => "The server's ports, at its own address.",
+        _ => "Host port → container port. Leave the host port empty to not publish it.",
     };
 
     protected override async Task OnParametersSetAsync()
     {
+        // LANCommander's own images always need to mount their overlay
+        if (!ReferenceEquals(_checkedSpec, Spec))
+        {
+            _checkedSpec = Spec;
+            ImageChanged();
+        }
+
         if (_loadedFor == (HostId, Container))
             return;
 
         _loadedFor = (HostId, Container);
 
         await LoadUsesAsync();
+    }
+
+    void ImageChanged()
+    {
+        if (ContainerDefinition.IsServerImage(Spec.Image))
+            Spec.CanMountOverlay = true;
     }
 
     /// <summary>Reads the host's networks and the ports its other containers take, for checking this one's against.</summary>

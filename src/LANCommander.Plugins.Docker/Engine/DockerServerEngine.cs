@@ -13,6 +13,7 @@ namespace LANCommander.Plugins.Docker.Engine;
 /// <summary>Runs game servers as Docker containers on the plugin's Docker hosts.</summary>
 public sealed class DockerServerEngine(
     DockerHosts hosts,
+    ContainerFiles files,
     IConfiguration configuration,
     ILogger<DockerServerEngine> logger) : IServerEngineExtension, IAsyncDisposable
 {
@@ -30,7 +31,7 @@ public sealed class DockerServerEngine(
 
     private readonly ContainerConsoles _consoles = new(hosts);
 
-    private readonly ContainerFiles _files = new(hosts);
+    private readonly ContainerFiles _files = files;
 
     private IServerEngineHost? _host;
 

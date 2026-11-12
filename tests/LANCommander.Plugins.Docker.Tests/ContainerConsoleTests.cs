@@ -48,15 +48,50 @@ public sealed class ContainerConsoleTests
     }
 
     [Fact]
-    public void OnlyTheServersOwnLogFilesAreRead()
+    public void OnlyTheServersOwnLogFilesAndItsImagesAreRead()
     {
-        var consoles = new ContainerConsoles(TestHosts.Create());
         var settings = new DockerServerSettings { HostId = Guid.NewGuid(), ContainerId = "deusex", LogFiles = [new ContainerLogFile { Path = "/config/Overlay/System/server.log" }] };
+        var labels = new Dictionary<string, string> { ["com.lancommander.server.log.ucc"] = "/config/Overlay/System/ucc.log" };
 
-        var error = Assert.Throws<LANCommander.Plugins.Docker.Hosts.DockerHostException>(() =>
-            consoles.ReadLogAsync(settings, "file:/etc/shadow", new ServerEngineLogRequest(Follow: false), CancellationToken.None));
+        Assert.True(ContainerConsoles.IsLogFile(settings, labels, "/config/Overlay/System/server.log"));
+        Assert.True(ContainerConsoles.IsLogFile(settings, labels, "/config/Overlay/System/ucc.log"));
+        Assert.False(ContainerConsoles.IsLogFile(settings, labels, "/etc/shadow"));
+        Assert.False(ContainerConsoles.IsLogFile(settings, null, "/config/Overlay/System/ucc.log"));
+    }
 
-        Assert.Contains("isn't one of the server's log files", error.Message);
+    [Fact]
+    public void AnImagesLogFilesAreConsolesBeforeTheServersOwn()
+    {
+        var image = ContainerLogFile.FromLabels(new Dictionary<string, string>
+        {
+            ["com.lancommander.server.log.server-log"] = " /config/Overlay/System/server.log ",
+            ["com.lancommander.server.log.ucc"] = "/config/Overlay/System/ucc.log",
+            ["com.lancommander.server.log.empty"] = "",
+            ["com.lancommander.server.kind"] = "game",
+        });
+
+        var consoles = ContainerConsoles.For(new DockerServerSettings
+        {
+            HostId = Guid.NewGuid(),
+            ContainerId = "deusex",
+            LogFiles =
+            [
+                new ContainerLogFile { Name = "Mine", Path = "/config/Overlay/System/ucc.log" },
+                new ContainerLogFile { Name = "Chat", Path = "/config/Overlay/System/chat.log" },
+            ],
+        }, image);
+
+        Assert.Equal(
+        [
+            "log",
+            "file:/config/Overlay/System/server.log",
+            "file:/config/Overlay/System/ucc.log",
+            "file:/config/Overlay/System/chat.log",
+            "attach",
+            "shell",
+        ], consoles.Select(c => c.Id));
+
+        Assert.Equal(["Container log", "Server log", "Ucc", "Chat", "Attach", "Shell"], consoles.Select(c => c.Name));
     }
 
     [Theory]

@@ -26,9 +26,32 @@
                 <FormItem Label="Address" Required Help="@AddressHelp" Class="edit-form-mono">
                     <TextInput @bind-Value="editing.Address" Placeholder="@DockerHost.DefaultAddress" />
                 </FormItem>
-                <FormItem Label="Data folder" Help="A folder on this Docker host that new servers keep their files in, each in a folder named after its container, such as /data/Servers. Leave empty to keep them in Docker volumes." Class="edit-form-mono">
-                    <TextInput @bind-Value="editing.DataFolder" Placeholder="/data/Servers" />
-                </FormItem>
+                <div class="edit-form-pair">
+                    <FormItem Label="Data folder" Help="A folder on this Docker host that new servers keep their files in, each in a folder named after its container, such as /data/Servers. Leave empty to keep them in Docker volumes." Class="edit-form-mono">
+                        <TextInput @bind-Value="editing.DataFolder" Placeholder="/data/Servers" />
+                    </FormItem>
+                    <FormItem Label="Data folder on this server" Class="edit-form-mono">
+                        <ChildContent>
+                            <TextInput @bind-Value="editing.LocalDataFolder" Disabled="string.IsNullOrWhiteSpace(editing.DataFolder)" Placeholder="@(string.IsNullOrWhiteSpace(editing.DataFolder) ? "" : $"Same as the data folder: {editing.DataFolder.Trim()}")" />
+                        </ChildContent>
+                        <HelpTemplate>
+                            <span>Where LANCommander finds the data folder, so servers' files can be managed while they're stopped too. If LANCommander runs in a container, mount the data folder into it, such as /data/Servers at /servers, and give that here. Leave empty if LANCommander runs on this Docker host itself.</span>
+                            @if (!string.IsNullOrWhiteSpace(editing.DataFolder))
+                            {
+                                <div>
+                                    @if (HostFolders.LocalDataFolderOf(editing) is { } local && Directory.Exists(local))
+                                    {
+                                        <Typography Secondary Small>Found at @local.</Typography>
+                                    }
+                                    else
+                                    {
+                                        <Typography Warning Small>LANCommander can't find it@(string.IsNullOrWhiteSpace(editing.LocalDataFolder) ? "" : $" at {editing.LocalDataFolder.Trim()}"), so servers' files are only managed through their containers, while they run.</Typography>
+                                    }
+                                </div>
+                            }
+                        </HelpTemplate>
+                    </FormItem>
+                </div>
 
                 @if (_formError != null)
                 {
@@ -265,14 +288,14 @@
         await LoadUnusedAsync();
     }
 
-    static DockerHost Copy(DockerHost host) => new() { Id = host.Id, Name = host.Name, Address = host.Address, DataFolder = host.DataFolder };
+    static DockerHost Copy(DockerHost host) => host.Copy();
 
     bool IsNew(DockerHost host) => Original(host) == null;
 
     DockerHost? Original(DockerHost host) => _hosts.FirstOrDefault(h => h.Id == host.Id);
 
     bool IsSaved(DockerHost host) => Hosts.Find(host.Id) is { } saved
-        && saved.Name == host.Name && saved.Address == host.Address && saved.DataFolder == host.DataFolder;
+        && saved.Name == host.Name && saved.Address == host.Address && saved.DataFolder == host.DataFolder && saved.LocalDataFolder == host.LocalDataFolder;
 
     async Task CheckAsync(DockerHost host)
     {
@@ -350,6 +373,7 @@
         editing.Name = editing.Name?.Trim() ?? "";
         editing.Address = editing.Address?.Trim() ?? "";
         editing.DataFolder = editing.DataFolder?.Trim() ?? "";
+        editing.LocalDataFolder = editing.DataFolder.Length == 0 ? "" : editing.LocalDataFolder?.Trim() ?? "";
 
         if (editing.Name.Length == 0)
         {

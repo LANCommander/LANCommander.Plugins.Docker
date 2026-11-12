@@ -1,0 +1,134 @@
+@* A container's files, as the server's Files page shows them, to choose one from *@
+@inject ContainerFiles Files
+
+<Card Title="@Title" Subtitle="@CurrentPath">
+    <Extra>
+        <Button Text Small Icon="IconType.X" title="Close" OnClick="OnClose" />
+    </Extra>
+    <ChildContent>
+        <Flex Vertical Gap="Gap.Small">
+            @if (_error != null)
+            {
+                <Alert Warning>@_error</Alert>
+            }
+
+            <div style="max-height: 24rem; overflow: auto;">
+                <Flex Vertical Gap="Gap.Small">
+                    @if (_folder.Length > 0)
+                    {
+                        <Button Small Text Icon="IconType.ArrowBendLeftUp" OnClick="() => OpenAsync(Parent(_folder))">..</Button>
+                    }
+
+                    @if (_loading)
+                    {
+                        <Typography Secondary>Listing the files…</Typography>
+                    }
+                    else if (_error == null && _files.Count == 0)
+                    {
+                        <Typography Secondary>Nothing here.</Typography>
+                    }
+
+                    @foreach (var file in _files)
+                    {
+                        <Flex Gap="Gap.Small" Align="Align.Center" Justify="Justify.SpaceBetween">
+                            @if (file.IsDirectory)
+                            {
+                                <Button Small Text Icon="IconType.FolderSimple" OnClick="() => OpenAsync(Join(_folder, file.Name))">@file.Name</Button>
+                            }
+                            else
+                            {
+                                <Button Small Text Icon="IconType.FileText" OnClick="() => Pick(file)">@file.Name</Button>
+                                <Typography Secondary Small>@Describe(file)</Typography>
+                            }
+                        </Flex>
+                    }
+                </Flex>
+            </div>
+
+            @if (Help != null)
+            {
+                <Typography Secondary Small>@Help</Typography>
+            }
+        </Flex>
+    </ChildContent>
+</Card>
+
+@code {
+    [Parameter, EditorRequired] public Guid HostId { get; set; }
+
+    [Parameter, EditorRequired] public string Container { get; set; } = "";
+
+    [Parameter] public string Title { get; set; } = "Choose a file";
+
+    [Parameter] public string? Help { get; set; }
+
+    /// <summary>Given the file's path in the container, and its name.</summary>
+    [Parameter] public EventCallback<(string Path, string Name)> OnPick { get; set; }
+
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    DockerServerSettings Settings => new() { HostId = HostId, ContainerId = Container };
+
+    // The folder shown, relative to the files' root, as the Files page names it
+    string _folder = "";
+    string _root = "/";
+    IReadOnlyList<LANCommander.Server.Plugins.ServerEngineFile> _files = [];
+    bool _loading;
+    string? _error;
+
+    string CurrentPath => InContainer(_folder);
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _root = (await Files.DescribeAsync(Settings, CancellationToken.None)).Root;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            return;
+        }
+
+        await OpenAsync("");
+    }
+
+    async Task OpenAsync(string folder)
+    {
+        _loading = true;
+        _error = null;
+
+        try
+        {
+            _files = (await Files.ListAsync(Settings, folder, CancellationToken.None))
+                .OrderByDescending(f => f.IsDirectory)
+                .ThenBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+            _folder = folder;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    Task Pick(LANCommander.Server.Plugins.ServerEngineFile file) =>
+        OnPick.InvokeAsync((InContainer(Join(_folder, file.Name)), file.Name));
+
+    string InContainer(string path) => ContainerFiles.InContainer(_root, path);
+
+    static string Join(string folder, string name) => folder.Length == 0 ? name : $"{folder}/{name}";
+
+    static string Parent(string folder) => folder.LastIndexOf('/') is var slash and > 0 ? folder[..slash] : "";
+
+    static string Describe(LANCommander.Server.Plugins.ServerEngineFile file) =>
+        string.Join(" · ", new[]
+        {
+            file.Size is { } size ? size < 1024 ? $"{size} B" : size < 1024 * 1024 ? $"{size / 1024.0:0.#} KB" : $"{size / (1024.0 * 1024):0.#} MB" : null,
+            file.LastModified?.ToLocalTime().ToString("g"),
+        }.Where(s => s != null));
+}

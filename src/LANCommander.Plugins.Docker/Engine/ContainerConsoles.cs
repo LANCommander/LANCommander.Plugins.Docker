@@ -39,34 +39,34 @@ internal sealed class ContainerConsoles(DockerHosts hosts)
 
     private const string TailScript = """exec tail -n "$2" -- "$1" """;
 
-    public static IReadOnlyList<ServerEngineConsole> For(DockerServerSettings settings) =>
+    /// <param name="imageLogFiles">The log files the container's image names in its labels, as last seen.</param>
+    public static IReadOnlyList<ServerEngineConsole> For(DockerServerSettings settings, IReadOnlyList<ContainerLogFile>? imageLogFiles = null) =>
         settings.HostId == null || string.IsNullOrWhiteSpace(settings.ContainerId)
             ? []
             :
             [
                 new(LogId, "Container log", ServerEngineConsoleKind.Log),
-                .. LogFilesOf(settings).Select(file => new ServerEngineConsole(FilePrefix + file.Path.Trim(), string.IsNullOrWhiteSpace(file.Name) ? file.Path.Trim() : file.Name.Trim(), ServerEngineConsoleKind.Log)),
+                .. LogFilesOf(settings, imageLogFiles).Select(file => new ServerEngineConsole(FilePrefix + file.Path.Trim(), string.IsNullOrWhiteSpace(file.Name) ? file.Path.Trim() : file.Name.Trim(), ServerEngineConsoleKind.Log)),
                 new(AttachId, "Attach", ServerEngineConsoleKind.Terminal),
                 new(ShellId, "Shell", ServerEngineConsoleKind.Terminal),
             ];
 
-    private static IEnumerable<ContainerLogFile> LogFilesOf(DockerServerSettings settings) =>
-        (settings.LogFiles ?? [])
+    /// <summary>The image's log files, then the server's own besides them.</summary>
+    internal static IEnumerable<ContainerLogFile> LogFilesOf(DockerServerSettings settings, IReadOnlyList<ContainerLogFile>? imageLogFiles) =>
+        (imageLogFiles ?? []).Concat(settings.LogFiles ?? [])
             .Where(file => !string.IsNullOrWhiteSpace(file.Path))
             .DistinctBy(file => file.Path.Trim());
+
+    /// <summary>Whether the server's settings, or the container's labels, name the file as one of its logs.</summary>
+    internal static bool IsLogFile(DockerServerSettings settings, IDictionary<string, string>? labels, string path) =>
+        LogFilesOf(settings, ContainerLogFile.FromLabels(labels)).Any(file => file.Path.Trim() == path);
 
     public IAsyncEnumerable<ServerEngineLogLine> ReadLogAsync(DockerServerSettings settings, string consoleId, ServerEngineLogRequest request, CancellationToken cancellationToken)
     {
         if (!consoleId.StartsWith(FilePrefix, StringComparison.Ordinal))
             return ReadContainerLogAsync(settings, request, cancellationToken);
 
-        var path = consoleId[FilePrefix.Length..];
-
-        // Only the files the server's settings name, not whichever a console id might
-        if (LogFilesOf(settings).All(file => file.Path.Trim() != path))
-            throw new DockerHostException($"{path} isn't one of the server's log files.");
-
-        return ReadLogFileAsync(settings, path, request, cancellationToken);
+        return ReadLogFileAsync(settings, consoleId[FilePrefix.Length..], request, cancellationToken);
     }
 
     private async IAsyncEnumerable<ServerEngineLogLine> ReadLogFileAsync(DockerServerSettings settings, string path, ServerEngineLogRequest request, [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -74,6 +74,10 @@ internal sealed class ContainerConsoles(DockerHosts hosts)
         var client = hosts.GetClient(settings.HostId);
         var container = await OrNotFound(() => client.Containers.InspectContainerAsync(settings.ContainerId, cancellationToken), settings);
         var tail = request.Tail ?? DefaultTail;
+
+        // Only the files the server's settings or its image name, not whichever a console id might
+        if (!IsLogFile(settings, container.Config?.Labels, path))
+            throw new DockerHostException($"{path} isn't one of the server's log files.");
 
         // Commands only run in a running container; a stopped one's file is copied out as it was left
         if (container.State is not { Running: true })

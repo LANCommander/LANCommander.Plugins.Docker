@@ -43,6 +43,24 @@ public sealed class DockerHost
     /// </summary>
     public string DataFolder { get; set; } = "";
 
+    /// <summary>
+    /// Where LANCommander itself finds <see cref="DataFolder"/>, for managing servers' files directly,
+    /// whether or not they're running: e.g. <c>/servers</c> when LANCommander runs in a container with
+    /// the host's <c>/data/Servers</c> mounted there. Empty when it's the same path, as when LANCommander
+    /// runs on the Docker host itself; see <see cref="HostFolders"/>.
+    /// </summary>
+    public string LocalDataFolder { get; set; } = "";
+
+    /// <summary>A copy, for editing without changing the saved host.</summary>
+    public DockerHost Copy() => new()
+    {
+        Id = Id,
+        Name = Name?.Trim() ?? "",
+        Address = Address?.Trim() ?? "",
+        DataFolder = DataFolder?.Trim() ?? "",
+        LocalDataFolder = LocalDataFolder?.Trim() ?? "",
+    };
+
     /// <summary>The address of the local daemon on this operating system.</summary>
     public static string DefaultAddress => OperatingSystem.IsWindows()
         ? "npipe://./pipe/docker_engine"

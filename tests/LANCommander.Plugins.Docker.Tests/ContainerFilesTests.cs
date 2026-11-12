@@ -7,17 +7,94 @@ namespace LANCommander.Plugins.Docker.Tests;
 /// <summary>The engine's files, as far as they can be tried without a Docker daemon.</summary>
 public sealed class ContainerFilesTests
 {
+    private static MountedFolder Mount(string destination, string? local = null) => new(destination, "/data/Servers" + destination, true, local);
+
     [Theory]
-    [InlineData(null, "/data", "/data")]
-    [InlineData(null, "/data/", "/data")]
-    [InlineData(null, "", "/")]
-    [InlineData(null, null, "/")]
-    [InlineData("/srv/game", "/data", "/srv/game")]
-    [InlineData("srv/game/", "/data", "/srv/game")]
-    [InlineData("  ", "/data", "/data")]
-    [InlineData("/", "/data", "/")]
-    public void TheFilesAreUnderTheChosenFolderOrTheWorkingDirectory(string? filesPath, string? workingDirectory, string expected) =>
-        Assert.Equal(expected, ContainerFiles.RootOf(new DockerServerSettings { FilesPath = filesPath }, workingDirectory));
+    [InlineData(new string[0], "/data", "/data")]
+    [InlineData(new string[0], "/data/", "/data")]
+    [InlineData(new string[0], "", "/")]
+    [InlineData(new string[0], null, "/")]
+    [InlineData(new[] { "/config" }, "/srv", "/config")]
+    [InlineData(new[] { "/config", "/config/Server" }, "/srv", "/config")]
+    [InlineData(new[] { "/srv/game/maps", "/srv/game/cfg" }, null, "/srv/game")]
+    [InlineData(new[] { "/data", "/logs" }, null, "/")]
+    public void TheFilesStartAtTheFolderHoldingEveryMountOrTheWorkingDirectory(string[] mounts, string? workingDirectory, string expected) =>
+        Assert.Equal(expected, ContainerFiles.RootOf(mounts.Select(m => Mount(m)).ToList(), workingDirectory));
+
+    [Fact]
+    public void APathIsFoundInTheDeepestMountHoldingIt()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "lancommander-test-" + Guid.NewGuid().ToString("N"));
+        var own = Path.Combine(root, "quake3", "dm1");
+        var game = Path.Combine(root, "quake3", "Base");
+
+        MountedFolder[] mounts = [Mount("/config", own), Mount("/config/Server", game), Mount("/data"), Mount("/srv/a/b", own)];
+
+        Assert.Equal(new FileLocation.OnHost(own), ContainerFiles.Locate("/config", mounts));
+        Assert.Equal(new FileLocation.OnHost(Path.Combine(own, "Overlay", "server.cfg")), ContainerFiles.Locate("/config/Overlay/server.cfg", mounts));
+        Assert.Equal(new FileLocation.OnHost(Path.Combine(game, "baseq3")), ContainerFiles.Locate("/config/Server/baseq3", mounts));
+        Assert.Equal(new FileLocation.OnHost(Path.Combine(own, "Servers")), ContainerFiles.Locate("/config/Servers", mounts));
+
+        // A volume, or a folder LANCommander can't reach
+        Assert.Equal(FileLocation.InContainer.Instance, ContainerFiles.Locate("/data/x", mounts));
+
+        // The folders leading to mounts hold only them
+        var between = Assert.IsType<FileLocation.Between>(ContainerFiles.Locate("/", mounts));
+        Assert.Equal(["config", "data", "srv"], between.Children);
+        Assert.Equal(["b"], Assert.IsType<FileLocation.Between>(ContainerFiles.Locate("/srv/a", mounts)).Children);
+
+        Assert.Equal(FileLocation.InContainer.Instance, ContainerFiles.Locate("/etc", mounts));
+    }
+
+    [Fact]
+    public void AFolderOnTheHostIsListedWithTheMountsBelowIt()
+    {
+        var folder = Directory.CreateTempSubdirectory("lancommander-test-");
+
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(folder.FullName, "Overlay"));
+            File.WriteAllText(Path.Combine(folder.FullName, "server.cfg"), "hostname LAN\n");
+
+            var files = ContainerFiles.ListLocal(folder.FullName, "/config", ["Overlay", "Server"]);
+
+            Assert.Equal(["Overlay", "Server", "server.cfg"], files.Select(f => f.Name).Order(StringComparer.Ordinal));
+            Assert.Equal(13, files.Single(f => f.Name == "server.cfg").Size);
+            Assert.True(files.Single(f => f.Name == "Server").IsDirectory);
+
+            Assert.Throws<DirectoryNotFoundException>(() => ContainerFiles.ListLocal(Path.Combine(folder.FullName, "missing"), "/config/missing", []));
+            Assert.Throws<IOException>(() => ContainerFiles.ListLocal(Path.Combine(folder.FullName, "server.cfg"), "/config/server.cfg", []));
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ServersSavedWithAFilesFolderStillLoad()
+    {
+        var settings = ServerEngineSettings.Read<DockerServerSettings>("""{ "HostId": "2f0c6c3e-58a4-4c55-9a43-2d7a2b1e9b10", "ContainerId": "quake3-dm", "FilesPath": "/config/Merged" }""");
+
+        Assert.Equal("quake3-dm", settings.ContainerId);
+    }
+
+    [Fact]
+    public void BindsAreReadAsWritten()
+    {
+        var sources = ContainerFiles.WrittenSources(
+        [
+            "/data/Servers/quake3/dm1:/config",
+            @"D:\Servers\quake3\Base:/config/Server:ro",
+            "C:/Servers/x:/x/",
+            "maps:/maps",
+        ]);
+
+        Assert.Equal("/data/Servers/quake3/dm1", sources["/config"]);
+        Assert.Equal(@"D:\Servers\quake3\Base", sources["/config/Server"]);
+        Assert.Equal("C:/Servers/x", sources["/x"]);
+        Assert.Equal("maps", sources["/maps"]);
+    }
 
     [Theory]
     [InlineData("/data", "", "/data")]
