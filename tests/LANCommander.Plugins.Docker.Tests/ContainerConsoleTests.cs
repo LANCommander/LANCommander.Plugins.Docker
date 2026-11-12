@@ -51,7 +51,7 @@ public sealed class ContainerConsoleTests
     public void OnlyTheServersOwnLogFilesAndItsImagesAreRead()
     {
         var settings = new DockerServerSettings { HostId = Guid.NewGuid(), ContainerId = "deusex", LogFiles = [new ContainerLogFile { Path = "/config/Overlay/System/server.log" }] };
-        var labels = new Dictionary<string, string> { ["com.lancommander.server.log.ucc"] = "/config/Overlay/System/ucc.log" };
+        var labels = new Dictionary<string, string> { ["app.lancommander.server.log.ucc"] = "/config/Overlay/System/ucc.log" };
 
         Assert.True(ContainerConsoles.IsLogFile(settings, labels, "/config/Overlay/System/server.log"));
         Assert.True(ContainerConsoles.IsLogFile(settings, labels, "/config/Overlay/System/ucc.log"));
@@ -64,10 +64,10 @@ public sealed class ContainerConsoleTests
     {
         var image = ContainerLogFile.FromLabels(new Dictionary<string, string>
         {
-            ["com.lancommander.server.log.server-log"] = " /config/Overlay/System/server.log ",
-            ["com.lancommander.server.log.ucc"] = "/config/Overlay/System/ucc.log",
-            ["com.lancommander.server.log.empty"] = "",
-            ["com.lancommander.server.kind"] = "game",
+            ["app.lancommander.server.log.server-log"] = " /config/Overlay/System/server.log ",
+            ["app.lancommander.server.log.ucc"] = "/config/Overlay/System/ucc.log",
+            ["app.lancommander.server.log.empty"] = "",
+            ["app.lancommander.server.kind"] = "game",
         });
 
         var consoles = ContainerConsoles.For(new DockerServerSettings

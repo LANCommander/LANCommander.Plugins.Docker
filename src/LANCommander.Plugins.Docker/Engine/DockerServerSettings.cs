@@ -27,9 +27,9 @@ public sealed class ContainerLogFile
 {
     /// <summary>
     /// An image names its log files with a label each: this, a name, and the file's path as its value,
-    /// e.g. <c>com.lancommander.server.log.server-log=/config/Overlay/System/server.log</c>.
+    /// e.g. <c>app.lancommander.server.log.server-log=/config/Overlay/System/server.log</c>.
     /// </summary>
-    public const string LabelPrefix = "com.lancommander.server.log.";
+    public const string LabelPrefix = "app.lancommander.server.log.";
 
     /// <summary>What its console is called, e.g. <c>Server log</c>.</summary>
     public string Name { get; set; } = "";

@@ -21,8 +21,8 @@ public enum ImageKind
 /// <list type="table">
 /// <item><term><c>org.opencontainers.image.title</c></term><description>The game's name, e.g. <c>Quake III Arena</c>.</description></item>
 /// <item><term><c>org.opencontainers.image.description</c></term><description>A line about it.</description></item>
-/// <item><term><c>com.lancommander.server.kind</c></term><description><c>game</c>, <c>base</c>, or anything else to leave it out.</description></item>
-/// <item><term><c>com.lancommander.server.external-id.&lt;provider&gt;</c></term><description>
+/// <item><term><c>app.lancommander.server.kind</c></term><description><c>game</c>, <c>base</c>, or anything else to leave it out.</description></item>
+/// <item><term><c>app.lancommander.server.external-id.&lt;provider&gt;</c></term><description>
 /// The game's id with a provider LANCommander keeps games' ids for, as its game records name them:
 /// <c>igdb</c>, <c>steam</c> (the store's app id, not the dedicated server's), <c>gog</c>.
 /// </description></item>
@@ -32,8 +32,8 @@ public sealed record ImageLabels(string? Title, string? Description, ImageKind? 
 {
     public const string TitleLabel = "org.opencontainers.image.title";
     public const string DescriptionLabel = "org.opencontainers.image.description";
-    public const string KindLabel = "com.lancommander.server.kind";
-    public const string ExternalIdPrefix = "com.lancommander.server.external-id.";
+    public const string KindLabel = "app.lancommander.server.kind";
+    public const string ExternalIdPrefix = "app.lancommander.server.external-id.";
 
     public static readonly ImageLabels None = new(null, null, null, new Dictionary<string, string>());
 

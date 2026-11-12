@@ -37,12 +37,12 @@ public sealed class ImageCatalogTests
             { "name": "quake3", "labels": {
                 "org.opencontainers.image.title": "Quake III Arena",
                 "org.opencontainers.image.description": "Quake III Arena dedicated server",
-                "com.lancommander.server.kind": "game",
-                "com.lancommander.server.external-id.igdb": "355" } },
+                "app.lancommander.server.kind": "game",
+                "app.lancommander.server.external-id.igdb": "355" } },
             { "repository": "lancommander/callofjuarezboundinblood", "labels": {
                 "org.opencontainers.image.title": "Call of Juarez: Bound in Blood",
-                "com.lancommander.server.external-id.steam": "21980" } },
-            { "name": "zandronum", "labels": { "com.lancommander.server.kind": "tool" } },
+                "app.lancommander.server.external-id.steam": "21980" } },
+            { "name": "zandronum", "labels": { "app.lancommander.server.kind": "tool" } },
             { "labels": { "org.opencontainers.image.title": "No name" } }
           ]
         }
@@ -84,11 +84,11 @@ public sealed class ImageCatalogTests
         {
             ["org.opencontainers.image.title"] = " Call of Juarez: Bound in Blood ",
             ["org.opencontainers.image.description"] = "Its dedicated server",
-            ["com.lancommander.server.kind"] = "Game",
-            ["com.lancommander.server.external-id.steam"] = "21980",
-            ["com.lancommander.server.external-id.IGDB"] = " 1234 ",
-            ["com.lancommander.server.external-id."] = "nameless",
-            ["com.lancommander.server.external-id.gog"] = " ",
+            ["app.lancommander.server.kind"] = "Game",
+            ["app.lancommander.server.external-id.steam"] = "21980",
+            ["app.lancommander.server.external-id.IGDB"] = " 1234 ",
+            ["app.lancommander.server.external-id."] = "nameless",
+            ["app.lancommander.server.external-id.gog"] = " ",
             ["maintainer"] = "LANCommander",
         });
 

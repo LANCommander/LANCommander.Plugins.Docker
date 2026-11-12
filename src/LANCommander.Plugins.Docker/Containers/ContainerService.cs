@@ -458,7 +458,7 @@ public sealed class ContainerService(DockerHosts hosts, ILogger<ContainerService
     }
 
     /// <summary>On the containers the plugin creates, and kept when they're replaced.</summary>
-    public const string ManagedLabel = "com.lancommander.docker.managed";
+    public const string ManagedLabel = "app.lancommander.docker.managed";
 
     /// <summary>What removing the container would do: which of its files could go with it.</summary>
     public async Task<RemovalPlan> PlanRemovalAsync(Guid hostId, string container, CancellationToken cancellationToken = default)
