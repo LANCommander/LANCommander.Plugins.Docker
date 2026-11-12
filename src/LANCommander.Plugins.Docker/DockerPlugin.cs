@@ -9,8 +9,7 @@ using Microsoft.Extensions.Logging;
 [assembly: LANCommanderPlugin(
     typeof(LANCommander.Plugins.Docker.DockerPlugin),
     Id = LANCommander.Plugins.Docker.DockerPlugin.PluginId,
-    // IServerEngineExtension.SettingsComponent, where the plugin's hosts are configured, arrives in 2.2.0-beta.3
-    MinHostVersion = "2.2.0-beta.3",
+    MinHostVersion = "2.2.0-beta.4",
     Hosts = PluginHost.Server)]
 
 namespace LANCommander.Plugins.Docker;

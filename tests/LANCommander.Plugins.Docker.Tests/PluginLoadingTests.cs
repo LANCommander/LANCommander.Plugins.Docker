@@ -69,7 +69,8 @@ public sealed class PluginLoadingTests : IDisposable
     [Theory]
     [InlineData("2.2.0-alpha.4", false)]
     [InlineData("2.2.0-beta.1", false)]
-    [InlineData("2.2.0-beta.3", true)]
+    [InlineData("2.2.0-beta.3", false)]
+    [InlineData("2.2.0-beta.4", true)]
     [InlineData("2.2.0", true)]
     public void TheServerSkipsThePluginWhenItPredatesServerEngineSettings(string hostVersion, bool loads)
     {
